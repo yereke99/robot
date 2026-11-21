@@ -82,6 +82,8 @@ class Portal:
         self.agreement_doc = cfg.get("agreement_doc", 3715)
         self.agreement_disconnect = cfg.get("agreement_disconnect")
         self.agreement_generation_attempted = False
+        self.deposit_add_disconnect = cfg.get("deposit_add_disconnect")
+        self.deposit_add_attempted = False
         self.lock = asyncio.Lock() if cfg.get("session_lock") else None
 
         self.lot_ids = [41000001 + i for i in range(self.lots)]
@@ -434,6 +436,12 @@ class Portal:
             doc, app_lot, num = int(parts[-3]), int(parts[-2]), int(parts[-1])
             form = dict(parse_qsl(request.content.decode(), keep_blank_values=True))
             show3 = request.url.query == b"show=3"
+            deposit_save = show3 and "save_electronic_data" in form
+            disconnect = None
+            if doc == 3328 and not deposit_save:
+                if not self.deposit_add_attempted or self.deposit_add_disconnect == "always_before_commit":
+                    disconnect = self.deposit_add_disconnect
+                self.deposit_add_attempted = True
 
             def build():
                 if self.stage != "docs":
@@ -441,11 +449,16 @@ class Portal:
                     return self.redirect_to_stage()
                 loc = {"location": f"/ru/application/show_doc/{ANN}/{APP}/{doc}"}
                 if doc == 3328:
-                    if show3 and "save_electronic_data" in form:
+                    if form.get("typeDoc") != "3":
+                        self.bad("deposit POST did not select the e-wallet type")
+                    if deposit_save:
                         if app_lot not in self.deposit_added:
                             self.bad("deposit_save before deposit_add")
                         return httpx.Response(302, headers=loc), (lambda: self.deposit_saved.add(app_lot))
-                    return httpx.Response(200, html="ok"), (lambda: self.deposit_added.add(app_lot))
+                    response = httpx.Response(200, html="ok")
+                    if disconnect in ("before_commit", "always_before_commit"):
+                        return response
+                    return response, (lambda: self.deposit_added.add(app_lot))
                 # тех.спец page save
                 sigs = sorted(int(k[len("signature["):-1]) for k in form if k.startswith("signature["))
                 if sigs != sorted(self.ts_fids(app_lot, num)):
@@ -467,7 +480,7 @@ class Portal:
                     self.ts_saved[(app_lot, num)] = self.now()
                     self.last_ts_save_at = self.now()
                 return httpx.Response(302, headers=loc), commit
-            return await self.serve(request, P * 1.3, build)
+            return await self.serve(request, P * 1.3, build, disconnect=disconnect is not None)
 
         @r.post(url__regex=r".*/files/check_status/$")
         async def check_status(request):

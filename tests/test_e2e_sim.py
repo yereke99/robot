@@ -143,6 +143,45 @@ def test_unconfirmed_agreement_generation_stops_without_repeating_post(disconnec
     assert result["to_public_request_s"] is None
 
 
+@pytest.mark.parametrize("disconnect", ["before_commit", "after_commit"])
+def test_lost_deposit_selection_response_retries_before_saving_once(disconnect):
+    result = _run({
+        **FAST, "lag": 0.0, "want_log": True, "deposit_add_disconnect": disconnect,
+    })
+    _assert_submitted(result)
+
+    requests = result["log"]
+    deposit_path = f"/ru/application/show_doc/{sim_portal.ANN}/{sim_portal.APP}/3328/85000001/1"
+    select, retry, save = [req for req in requests if req["path"].startswith(deposit_path)]
+    assert (select["m"], select["path"], select["status"]) == ("POST", deposit_path, "RemoteProtocolError")
+    assert (retry["m"], retry["path"], retry["status"]) == ("POST", deposit_path, 200)
+    assert (save["m"], save["path"], save["status"]) == ("POST", f"{deposit_path}/?show=3", 302)
+    validate = next(req for req in requests if "/ajax_docs_next/" in req["path"])
+    publish = next(req for req in requests if "/ajax_public_application/" in req["path"])
+    ordered = (select, retry, save, validate, publish)
+    assert all(previous["t1"] <= current["t0"] for previous, current in zip(ordered, ordered[1:]))
+    assert sum("/ajax_create_application/" in req["path"] for req in requests) == 1
+
+
+def test_deposit_selection_disconnects_twice_and_stops_before_save():
+    result = _run({
+        **FAST, "lag": 0.0, "want_log": True, "deposit_add_disconnect": "always_before_commit",
+    })
+    assert result["error"]
+    assert result["violations"] == []
+
+    requests = result["log"]
+    deposit_path = f"/ru/application/show_doc/{sim_portal.ANN}/{sim_portal.APP}/3328/85000001/1"
+    selects = [req for req in requests if req["path"].startswith(deposit_path)]
+    assert [(req["m"], req["path"], req["status"]) for req in selects] == [
+        ("POST", deposit_path, "RemoteProtocolError"),
+        ("POST", deposit_path, "RemoteProtocolError"),
+    ]
+    assert not any("/ajax_docs_next/" in req["path"] for req in requests)
+    assert result["encr_info_calls"] == 0
+    assert result["to_public_request_s"] is None
+
+
 def test_dry_run_prices_the_application_without_publishing():
     result = _run({**FAST, "dry_run": True})
     assert result["error"] is None

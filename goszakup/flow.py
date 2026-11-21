@@ -1036,9 +1036,10 @@ def _first_download_target(html_text: str) -> Optional[tuple[int, str]]:
 
 
 class DocumentGenerationUnconfirmed(RuntimeError):
-    def __init__(self, app_id: str, doc_id: int):
+    def __init__(self, app_id: str, doc_id: int, *, lot_id: int | None = None):
+        lot = f" для лота {lot_id}" if lot_id is not None else ""
         super().__init__(
-            f"Связь прервалась при формировании документа {doc_id}. "
+            f"Связь прервалась при подготовке документа {doc_id}{lot}. "
             f"Проверь черновик {app_id} в кабинете."
         )
         self.app_id = app_id
@@ -1121,6 +1122,32 @@ async def _generate_doc_target(gz, ann, app_id, doc_id, fields, *, hint: str) ->
     raise AssertionError("unreachable")
 
 
+async def _select_deposit_type(gz, ann, app_id, doc_id, app_lot, type_doc) -> None:
+    fields = {"doc_id": doc_id, "lot_id": app_lot, "type_doc": type_doc}
+    try:
+        response = await gz.deposit_add(ann, app_id, **fields)
+    except httpx.TransportError as exc:
+        if type_doc != 3:
+            raise DocumentGenerationUnconfirmed(app_id, doc_id, lot_id=app_lot) from exc
+        # Choosing the e-wallet option only opens its form. The separate
+        # deposit_save operation persists the selection.
+        log.warning("flow.deposit.selection_response_lost", doc=doc_id,
+                    app_lot=app_lot, error_type=type(exc).__name__)
+        try:
+            async with asyncio.timeout(4.0):
+                response = await gz.deposit_add(ann, app_id, **fields)
+            if response.is_error:
+                response.raise_for_status()
+        except (httpx.TransportError, httpx.HTTPStatusError, TimeoutError) as retry_exc:
+            log.warning("flow.deposit.selection_retry_failed", doc=doc_id,
+                        app_lot=app_lot, error_type=type(retry_exc).__name__)
+            raise DocumentGenerationUnconfirmed(app_id, doc_id, lot_id=app_lot) from retry_exc
+        log.info("flow.deposit.selection_recovered", doc=doc_id, app_lot=app_lot)
+        return
+    if response.is_error:
+        response.raise_for_status()
+
+
 @dataclass
 class _SaveOp:
     """One deferred signature-commit POST. ``run(client)`` issues the save on the
@@ -1200,8 +1227,7 @@ async def _prepare_doc(gz, ns, params, app_id, app_lot_map, beneficiary, base_ur
         ops: list[_SaveOp] = []
         gtype = params.guarantee_type
         for app_lot in app_lot_map.values():
-            await gz.deposit_add(ann, app_id, doc_id=spec.doc_id, lot_id=app_lot,
-                                 type_doc=gtype)
+            await _select_deposit_type(gz, ann, app_id, spec.doc_id, app_lot, gtype)
             ops.append(_SaveOp(
                 f"deposit_{spec.doc_id}_{app_lot}", spec.doc_id,
                 lambda c, d=spec.doc_id, lot=app_lot, gt=gtype:
