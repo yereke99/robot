@@ -13,11 +13,13 @@ from contextlib import AsyncExitStack
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from websockets.protocol import State
 
 from goszakup import flow, tumar
 from goszakup.local_signer import KalkanSigner
+from goszakup.state import StateStore
 
 
 async def test_idle_provider_reconnects_once_for_concurrent_bids(monkeypatch):
@@ -83,6 +85,75 @@ async def test_disconnected_provider_reconnects_while_price_page_loads(monkeypat
     provider.connect.assert_awaited_once()
     client.get_encr_info.assert_awaited_once()
     assert client.add_encrypt.await_args.kwargs["salt"] == "fresh"
+
+
+@pytest.mark.parametrize(("stop_after_docs", "warmup_fails", "attempts"), [
+    (False, False, 1), (False, True, 2), (True, False, 0),
+])
+async def test_bid_reconnects_during_draft_creation(monkeypatch, tmp_path, stop_after_docs,
+                                                     warmup_fails, attempts):
+    provider = tumar.TumarCSP(api_key="unused", autofill=lambda _: False)
+    provider._ws = SimpleNamespace(state=State.OPEN)
+    reconnect_started = asyncio.Event()
+    price_page_loaded = asyncio.Event()
+
+    async def poll(*args, **kwargs):
+        provider._ws = None
+
+    async def connect():
+        if not reconnect_started.is_set():
+            reconnect_started.set()
+            await price_page_loaded.wait()
+            if warmup_fails:
+                raise tumar.TumarError("provider temporarily unavailable")
+        provider._ws = SimpleNamespace(state=State.OPEN)
+        provider.version = "2.0.0.0"
+
+    async def create(*args, **kwargs):
+        if not stop_after_docs:
+            await reconnect_started.wait()
+        return "200"
+
+    async def get_page(path):
+        if path.endswith("/3334"):
+            return '<input data-app-lot-id="300">'
+        if path == "/ru/application/docs/100/200":
+            return ""
+        assert path == "/ru/application/priceoffers/100/200"
+        price_page_loaded.set()
+        return ('<input id="public_key" value="KEY">'
+                '<input app_lot_id="300" buy_lot_point_id="400">')
+
+    mock_connect = AsyncMock(side_effect=connect)
+    monkeypatch.setattr(provider, "connect", mock_connect)
+    monkeypatch.setattr(provider, "encrypt_offer_price", AsyncMock(
+        return_value=tumar.EncryptResult(encrypted_data="ENC", session_key="SESSION",
+                                        info="SN", sign="SIGN")))
+    client = SimpleNamespace(
+        _http=None, _get_page=get_page, poll_announce_ready=poll, create_application=create,
+        add_lots=AsyncMock(), lots_next=AsyncMock(),
+        docs_next=AsyncMock(return_value=httpx.Response(200, json={"status": "ok"})),
+        get_encr_info=AsyncMock(return_value={"plnSum": 100, "minPrice": 80,
+                                              "salt": "fresh", "sign": "SIGN"}),
+        add_encrypt=AsyncMock(), save_gamma_signs=AsyncMock(), priceoffers_next_gamma=AsyncMock(),
+    )
+    params = flow.AtagosBidParams(
+        announce_id="100", tender_lot_ids=[1], dry_run=True, stop_after_docs=stop_after_docs,
+        tumar=provider, signer=SimpleNamespace(sign_text_with_tsa=AsyncMock(return_value="CMS")),
+        doc_plan=[],
+    )
+    state = await asyncio.wait_for(flow.submit_bid(
+        params=params, ci_session="dummy", gz_client=client,
+        company={"subject_address": "address", "iik": "account"},
+        beneficiary=None, state_store=StateStore(tmp_path),
+    ), timeout=2)
+
+    assert state.step == ("docs_ready" if stop_after_docs else "dry_run_complete")
+    assert mock_connect.await_count == attempts
+    if stop_after_docs:
+        client.get_encr_info.assert_not_awaited()
+    else:
+        client.get_encr_info.assert_awaited_once_with("100", "200", lp_id=400, version="2.0.0.0")
 
 
 async def test_cancelled_signing_drains_its_reply_before_the_next_command():

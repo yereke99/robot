@@ -19,7 +19,7 @@ import httpx
 import pytest
 import respx
 
-from goszakup.client import GoszakupClient
+from goszakup.client import GoszakupClient, LotDocumentSaveUnconfirmed
 
 HAR_FILE = Path(__file__).parent / "fixtures" / "v3bl.goszakup.gov.kz.har"
 
@@ -58,6 +58,18 @@ async def _run_with_mock(routes_setup, fn):
         routes_setup(r)
         async with GoszakupClient(ci_session="dummy") as gz:
             return await fn(gz)
+
+
+async def test_lost_lot_signature_response_reports_unconfirmed_save():
+    path = "/ru/application/show_doc/12345678/23456789/3334/34567890/1"
+    async with respx.mock(base_url="https://v3bl.goszakup.gov.kz") as router:
+        route = router.post(path).mock(side_effect=httpx.ReadTimeout(""))
+        async with GoszakupClient(ci_session="dummy") as client:
+            with pytest.raises(LotDocumentSaveUnconfirmed, match="3334.*страница 1.*ReadTimeout") as exc:
+                await client.sign_lot_doc("12345678", "23456789", 3334, 34567890, 1, signatures={42: "CMS"})
+
+    assert exc.value.app_id == "23456789"
+    assert route.call_count == 1
 
 
 async def test_create_application_request_shape(har_posts) -> None:

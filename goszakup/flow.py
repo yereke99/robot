@@ -715,6 +715,16 @@ async def submit_bid(
 
         _mark(state, "t0")
         state_store.save(state)
+        warm_reconnect_task = None
+        if (
+            not params.stop_after_docs and not params.resume_app_id
+            and isinstance(params.tumar, TumarCSP) and not params.tumar.connected
+        ):
+            # The shared provider may have gone idle while waiting for opening.
+            # Reconnect during draft creation and signing, before the price stage.
+            warm_reconnect_task = asyncio.create_task(params.tumar.ensure_connected())
+            stack.push_async_callback(_cancel_task, warm_reconnect_task)
+            log.info("flow.tumar.reconnect_prewarm.start")
         # Tender just opened — let the caller announce it (e.g. Telegram "тендер
         # открыт"). Fired in the BACKGROUND: awaiting a Telegram round-trip here
         # held up create_application by ~0.3-1s at the exact moment speed matters.
@@ -883,6 +893,7 @@ async def submit_bid(
         _mark(state, "gamma_start")
         discovered_lp_ids, prices_by_lp = await _gamma_price(
             gz, ns, params, app_id, stack, tumar_task=tumar_task,
+            warm_reconnect_task=warm_reconnect_task,
         )
         _mark(state, "gamma_done")
         if lp_id_cache is not None and discovered_lp_ids:
@@ -1794,12 +1805,12 @@ async def _open_tumar(params, stack):
     )
 
 
-async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None):
+async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None, warm_reconnect_task=None):
     """Encrypt and sign each price for the current application."""
     ann = params.announce_id
     tumar = params.tumar
-    reconnect_task = None
-    if isinstance(tumar, TumarCSP) and not tumar.connected:
+    reconnect_task = warm_reconnect_task
+    if isinstance(tumar, TumarCSP) and not tumar.connected and reconnect_task is None:
         # The local handshake can run alongside the portal's price-page read.
         reconnect_task = asyncio.create_task(tumar.ensure_connected())
         stack.push_async_callback(_cancel_task, reconnect_task)
@@ -1864,7 +1875,12 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None):
         tumar = await _open_tumar(params, stack)
     if isinstance(tumar, TumarCSP):
         if reconnect_task is not None:
-            await reconnect_task
+            try:
+                await reconnect_task
+            except Exception as exc:
+                if reconnect_task is not warm_reconnect_task:
+                    raise
+                log.warning("flow.gamma.reconnect_prewarm_failed", detail=type(exc).__name__)
         await tumar.ensure_connected()
 
     # Fallback source of pl_sum if ajax_get_encr_info doesn't carry it: the

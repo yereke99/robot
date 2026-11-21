@@ -101,6 +101,8 @@ async def test_clone_unauthenticated_isolates_jar():
     sib = gz.clone_unauthenticated()
     assert sib is not gz
     assert sib._http is not gz._http                     # private jar/transport
+    assert sib._transport is not gz._transport
+    assert sib._ssl_context is gz._ssl_context
     assert sib.base_url == gz.base_url
     assert sib._http.cookies.get("agreement_user_2024") == "AGREE"
     assert sib._http.cookies.get("ci_session") is None   # unauthenticated

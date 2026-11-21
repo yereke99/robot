@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import ssl
 import time
 from typing import Callable, Mapping, Optional, Sequence
 from urllib.parse import urlencode
@@ -104,6 +105,16 @@ class AlreadyAtPriceStage(RuntimeError):
 
     def __init__(self, message: str, *, app_id: Optional[str] = None):
         super().__init__(message)
+        self.app_id = app_id
+
+
+class LotDocumentSaveUnconfirmed(RuntimeError):
+    def __init__(self, app_id: str, doc_id: int, lot_id: int, page: int, cause: httpx.TransportError):
+        super().__init__(
+            f"Портал не подтвердил сохранение документа {doc_id}, страница {page}, "
+            f"лот заявки {lot_id} ({type(cause).__name__}). "
+            f"Проверьте подпись в черновике {app_id}."
+        )
         self.app_id = app_id
 
 
@@ -204,6 +215,7 @@ class GoszakupClient:
         timeout_s: float = 20.0,
         user_agent: Optional[str] = None,
         proxy: Optional[str] = None,
+        _ssl_context: Optional[ssl.SSLContext] = None,
     ):
         """`proxy` accepts http://, https://, socks5:// URLs (with creds).
         Used to route around goszakup's datacenter-IP block on v3bl: VPS
@@ -253,7 +265,11 @@ class GoszakupClient:
         # means the request never reached the server, so httpx safely retries
         # ESTABLISHING the connection — it never re-sends a request already on the
         # wire, so POSTs stay exactly-once (no duplicate create_application/save).
+        # The same verified context serves sibling transports so their separate
+        # connection pools don't each reload the CA bundle before polling.
+        self._ssl_context = _ssl_context if _ssl_context is not None else httpx.create_ssl_context()
         transport = _TimedTransport(
+            verify=self._ssl_context,
             retries=3,
             http2=(proxy is None),
             # The bot heartbeat runs every 30s. httpx's default 5s expiry
@@ -335,6 +351,7 @@ class GoszakupClient:
             timeout_s=self._timeout_s,
             user_agent=self._user_agent,
             proxy=self._proxy,
+            _ssl_context=self._ssl_context,
         )
         if csrf:
             host = httpx.URL(self.base_url).host
@@ -1003,11 +1020,16 @@ class GoszakupClient:
         data: dict[str, str | int] = {"send": "Сохранить", "sign_files": ""}
         for fid, sig in signatures.items():
             data[f"signature[{fid}]"] = sig
-        return await self._post_form(
-            f"/ru/application/show_doc/{announce_id}/{app_id}/{doc_id}/{lot_id}/{num}",
-            data,
-            referer_path=f"/ru/application/show_doc/{announce_id}/{app_id}/{doc_id}",
-        )
+        try:
+            return await self._post_form(
+                f"/ru/application/show_doc/{announce_id}/{app_id}/{doc_id}/{lot_id}/{num}",
+                data,
+                referer_path=f"/ru/application/show_doc/{announce_id}/{app_id}/{doc_id}",
+            )
+        except (httpx.ReadError, httpx.ReadTimeout, httpx.RemoteProtocolError,
+                httpx.WriteError, httpx.WriteTimeout) as exc:
+            # The portal may already have committed the signature.
+            raise LotDocumentSaveUnconfirmed(app_id, doc_id, lot_id, num, exc) from exc
 
     # ---------- beneficiary (Приложение 1: attach + describe the ID doc) ----------
 

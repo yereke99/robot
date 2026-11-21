@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -13,6 +14,7 @@ from websockets.protocol import State
 from goszakup import popup_filler, tumar
 from goszakup.bot import main
 from goszakup.bot.handlers import bid, scheduled
+from goszakup.state import SubmissionState
 from goszakup.timing import poll_interval_s
 
 
@@ -281,12 +283,12 @@ async def test_telegram_progress_keeps_the_result_with_a_long_history():
     assert "✅ Принято\n<b>Запросы и задержки</b>" in text
 
 
-@pytest.mark.parametrize("disconnected", [False, True])
-async def test_run_pipeline_hands_timestamps_and_draft_to_the_result_message(monkeypatch, disconnected):
+@pytest.mark.parametrize("outcome", ["success", "generation_lost", "save_timeout", "old_draft"])
+async def test_run_pipeline_hands_timestamps_and_draft_to_the_result_message(monkeypatch, tmp_path, outcome):
     ctx = SimpleNamespace(
         config=SimpleNamespace(
             raw={"defaults": {"pipeline_type": "repairs", "poll_interval_ms": 200}, "company": {}},
-            state_dir=None, base_url="https://invalid.test", proxy_url=None,
+            state_dir=tmp_path, base_url="https://invalid.test", proxy_url=None,
         ),
         history=SimpleNamespace(insert_pending=Mock(return_value=41), finish=Mock()),
         signer=object(), account_password=None, ci_session=lambda: "test-cookie",
@@ -295,34 +297,50 @@ async def test_run_pipeline_hands_timestamps_and_draft_to_the_result_message(mon
         lp_id_cache={}, tz_sig_cache={},
         gz_client=object(),
     )
-    monkeypatch.setattr(bid, "StateStore", Mock())
     monkeypatch.setattr(bid, "_ensure_logged_in", AsyncMock(return_value=True))
     monkeypatch.setattr(bid, "_ensure_tumar", AsyncMock(return_value=None))
     stamps = {"start": 0.0, "t0": 20.0, "lots_done": 22.0, "docs_accepted": 27.0,
               "gamma_done": 30.0, "public_done": 31.0}
-    async def submit(**_kwargs):
-        if disconnected:
-            trace = gz_timing.current_trace.get()
-            trace.marks.append((2.4, "t0"))
-            monkeypatch.setattr(trace, "mark", lambda phase: trace.marks.append((8.88, phase)))
+
+    announce_id = "17905992"
+    older_state = SubmissionState(announce_id=announce_id, application_id="42",
+                                  timestamps={"created": 1.0})
+    bid.StateStore(tmp_path, namespace="1").save(older_state)
+
+    async def submit(*, state_store, **_kwargs):
+        if outcome == "success":
+            return SimpleNamespace(step="public_ok", application_id="12345", timestamps=stamps, error=None)
+
+        trace = gz_timing.current_trace.get()
+        trace.marks.append((2.4, "t0"))
+        monkeypatch.setattr(trace, "mark", lambda phase: trace.marks.append((8.88, phase)))
+        if outcome == "generation_lost":
             raise bid.flow_repairs.DocumentGenerationUnconfirmed("12345", 3730)
-        return SimpleNamespace(step="public_ok", application_id="12345", timestamps=stamps, error=None)
+        if outcome == "save_timeout":
+            state_store.save(SubmissionState(announce_id=announce_id, application_id="12345",
+                                             timestamps={"created": time.time()}))
+        raise httpx.ReadTimeout("")
 
     monkeypatch.setattr(bid.flow_repairs, "submit_bid", submit)
     ok, app_id, error, row_id = await bid._run_pipeline(
-        ctx, 1, 1, None, object(), announce_id="17905992", lot_ids=[1],
+        ctx, 1, 1, None, object(), announce_id=announce_id, lot_ids=[1],
         price=0, dry_run=False,
     )
-    assert app_id == "12345" and row_id == 41
+    assert app_id == (None if outcome == "old_draft" else "12345") and row_id == 41
+    assert ctx.history.finish.call_args.kwargs["app_id"] == app_id
     text = bid._timing_text(row_id, 31.5, failed=not ok)
-    if disconnected:
-        assert not ok and "3730" in error
-        assert "От открытия до остановки:</b> 6.5 сек" in text
-        assert ctx.history.finish.call_args.kwargs["app_id"] == "12345"
-    else:
+    if outcome == "success":
         assert ok
         assert "От открытия до подачи:</b> 11.0 сек" in text
         assert "Ждал открытия тендера: 20.0 сек" in text
+    else:
+        assert not ok
+        if outcome == "generation_lost":
+            assert "3730" in error
+        else:
+            assert error == "ReadTimeout"
+        assert ctx.history.finish.call_args.kwargs["error"] == error
+        assert "От открытия до остановки:</b> 6.5 сек" in text
 
 
 async def test_bid_progress_does_not_delay_portal_or_hold_the_bid_lock(monkeypatch):

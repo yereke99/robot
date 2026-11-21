@@ -488,6 +488,10 @@ async def bid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _enter_bid_flow(update, context, announce_id=ids[0])
 
 
+def _exception_message(error: Exception) -> str:
+    return str(error).strip() or type(error).__name__
+
+
 async def _multi_bid(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -540,7 +544,7 @@ async def _multi_bid(
             raise
         except Exception as e:
             log.exception("multi_bid.failed", announce=announce_id)
-            await pm.finish(f"❌ <b>#{announce_id}</b> — ошибка: {escape(str(e)[:200])}")
+            await pm.finish(f"❌ <b>#{announce_id}</b> — ошибка: {escape(_exception_message(e)[:200])}")
 
     await asyncio.gather(*[_one(aid) for aid in announce_ids])
 
@@ -678,6 +682,17 @@ async def lot_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Submit execution (no dry-run, no countdown — instant)
 # ---------------------------------------------------------------------------
 
+def _failed_application_id(state_store: StateStore, announce_id: str, started_at: float) -> str | None:
+    try:
+        state = state_store.load(announce_id)
+        # The state file may still contain a draft from an earlier attempt.
+        if state.timestamps.get("created", 0) >= started_at:
+            return state.application_id
+    except (OSError, TypeError, ValueError, AttributeError) as exc:
+        log.warning("bid.failure_state_unavailable", error_type=type(exc).__name__)
+    return None
+
+
 async def _run_pipeline(
     ctx: BotContext,
     user_id: int,
@@ -719,6 +734,7 @@ async def _run_pipeline(
         _BID_TRACES.pop(next(iter(_BID_TRACES)))
     _BID_TRACES[bid_row_id] = trace
     token = current_progress.set(pm)
+    started_at = time.time()
     try:
         # Authenticate on the shared client before entering the flow.
         probe_t0 = time.monotonic()
@@ -816,8 +832,10 @@ async def _run_pipeline(
                 gz_client=ctx.gz_client,
             )
     except SessionExpired as e:
-        ctx.history.finish(bid_row_id, status="failed", error=f"session_expired: {e}")
-        return False, None, "session_expired", bid_row_id
+        app_id = _failed_application_id(state_store, announce_id, started_at)
+        ctx.history.finish(bid_row_id, status="failed", app_id=app_id,
+                           error=f"session_expired: {_exception_message(e)}")
+        return False, app_id, "session_expired", bid_row_id
     except AlreadyPrepared as e:
         ctx.history.finish(
             bid_row_id, status="cancelled",
@@ -832,9 +850,11 @@ async def _run_pipeline(
         return False, e.app_id, str(e), bid_row_id
     except Exception as e:
         log.exception("pipeline failed")
-        ctx.history.finish(bid_row_id, status="failed", error=str(e)[:500])
+        app_id = _failed_application_id(state_store, announce_id, started_at)
+        error = _exception_message(e)
+        ctx.history.finish(bid_row_id, status="failed", app_id=app_id, error=error[:500])
         ctx.invalidate_doc_pool()  # сброс пула при ошибке
-        return False, None, str(e), bid_row_id
+        return False, app_id, error, bid_row_id
     finally:
         if not any(phase in {"public_done", "dry_run_complete", "docs_ready"}
                    for _, phase in trace.marks):
@@ -863,7 +883,7 @@ async def _run_pipeline(
         ctx.save_caches()
         return True, state.application_id, "dry_run_complete", bid_row_id
 
-    err = state.error or f"step={state.step}"
+    err = (state.error or "").strip() or f"step={state.step}"
     ctx.history.finish(bid_row_id, status="failed", app_id=state.application_id, error=err[:500])
     # Сохраняем кэши даже при неуспешной ставке — sig_cache и lp_id могли заполниться
     ctx.save_caches()
