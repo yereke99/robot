@@ -281,7 +281,8 @@ async def test_telegram_progress_keeps_the_result_with_a_long_history():
     assert "✅ Принято\n<b>Запросы и задержки</b>" in text
 
 
-async def test_run_pipeline_hands_timestamps_to_the_result_message(monkeypatch):
+@pytest.mark.parametrize("disconnected", [False, True])
+async def test_run_pipeline_hands_timestamps_and_draft_to_the_result_message(monkeypatch, disconnected):
     ctx = SimpleNamespace(
         config=SimpleNamespace(
             raw={"defaults": {"pipeline_type": "repairs", "poll_interval_ms": 200}, "company": {}},
@@ -290,7 +291,8 @@ async def test_run_pipeline_hands_timestamps_to_the_result_message(monkeypatch):
         history=SimpleNamespace(insert_pending=Mock(return_value=41), finish=Mock()),
         signer=object(), account_password=None, ci_session=lambda: "test-cookie",
         agreement_cookie=lambda: None, get_doc_pool_if_fresh=Mock(return_value=[]),
-        save_doc_pool=Mock(), save_caches=Mock(), lp_id_cache={}, tz_sig_cache={},
+        save_doc_pool=Mock(), save_caches=Mock(), invalidate_doc_pool=Mock(),
+        lp_id_cache={}, tz_sig_cache={},
         gz_client=object(),
     )
     monkeypatch.setattr(bid, "StateStore", Mock())
@@ -298,16 +300,29 @@ async def test_run_pipeline_hands_timestamps_to_the_result_message(monkeypatch):
     monkeypatch.setattr(bid, "_ensure_tumar", AsyncMock(return_value=None))
     stamps = {"start": 0.0, "t0": 20.0, "lots_done": 22.0, "docs_accepted": 27.0,
               "gamma_done": 30.0, "public_done": 31.0}
-    monkeypatch.setattr(bid.flow_repairs, "submit_bid", AsyncMock(return_value=SimpleNamespace(
-        step="public_ok", application_id="app", timestamps=stamps, error=None)))
-    ok, _, _, row_id = await bid._run_pipeline(
+    async def submit(**_kwargs):
+        if disconnected:
+            trace = gz_timing.current_trace.get()
+            trace.marks.append((2.4, "t0"))
+            monkeypatch.setattr(trace, "mark", lambda phase: trace.marks.append((8.88, phase)))
+            raise bid.flow_repairs.DocumentGenerationUnconfirmed("12345", 3730)
+        return SimpleNamespace(step="public_ok", application_id="12345", timestamps=stamps, error=None)
+
+    monkeypatch.setattr(bid.flow_repairs, "submit_bid", submit)
+    ok, app_id, error, row_id = await bid._run_pipeline(
         ctx, 1, 1, None, object(), announce_id="17905992", lot_ids=[1],
         price=0, dry_run=False,
     )
-    assert ok and row_id == 41
-    text = bid._timing_text(row_id, 31.5)
-    assert "От открытия до подачи:</b> 11.0 сек" in text
-    assert "Ждал открытия тендера: 20.0 сек" in text
+    assert app_id == "12345" and row_id == 41
+    text = bid._timing_text(row_id, 31.5, failed=not ok)
+    if disconnected:
+        assert not ok and "3730" in error
+        assert "От открытия до остановки:</b> 6.5 сек" in text
+        assert ctx.history.finish.call_args.kwargs["app_id"] == "12345"
+    else:
+        assert ok
+        assert "От открытия до подачи:</b> 11.0 сек" in text
+        assert "Ждал открытия тендера: 20.0 сек" in text
 
 
 async def test_bid_progress_does_not_delay_portal_or_hold_the_bid_lock(monkeypatch):

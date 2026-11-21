@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 import structlog
-from lxml import html
+from lxml import etree, html
 
 log = structlog.get_logger("parser")
 
@@ -131,6 +131,26 @@ def extract_download_targets(
         raise ValueError(f"no download targets found on page ({hint})")
     log.info("parser.download_targets", hint=hint, count=len(targets))
     return targets
+
+
+def extract_prepared_doc_target(html_text: str, doc_id: int) -> tuple[int, str] | None:
+    """Find the download tied to the signing form of this specific document."""
+    try:
+        targets = extract_download_targets(html_text, quiet=True)
+        tree = html.fromstring(html_text)
+    except (ValueError, etree.ParserError):
+        return None
+    file_ids = {
+        int(value) for value in tree.xpath(
+            "//input[@name=$field]/@value", field=f"userfile[{doc_id}]",
+        ) if re.fullmatch(r"[1-9][0-9]*", value)
+    }
+    names = set(tree.xpath("//input/@name"))
+    confirmed = [
+        target for target in targets
+        if target[0] in file_ids or f"signature[{target[0]}]" in names
+    ]
+    return confirmed[0] if len(confirmed) == 1 else None
 
 
 def extract_priceoffer_structure(html_text: str) -> list[tuple[int, int]]:

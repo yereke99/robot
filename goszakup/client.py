@@ -509,13 +509,13 @@ class GoszakupClient:
                 raise SessionExpired(f"POST {path} returned login HTML (200)")
         return r
 
-    async def _get_page(self, path: str) -> str:
+    async def _get_page(self, path: str, *, follow_redirects: bool = True) -> str:
         """GET a goszakup HTML page. Follows 30x redirects -- once an
         application moves to the next stage, the previous URL 302s to the
         current one (e.g., /application/create/{ann} → /application/docs/{ann}/{app_id}).
         """
         log.info("http.get", path=path)
-        r = await self._http.get(path, follow_redirects=True)
+        r = await self._http.get(path, follow_redirects=follow_redirects)
         final_url = str(r.url)
         log.info(
             "http.get.done",

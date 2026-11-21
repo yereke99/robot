@@ -40,7 +40,7 @@ import structlog
 
 from .client import AlreadyAtPriceStage, AlreadyPrepared, GoszakupClient, SessionExpired
 from .local_signer import KalkanSigner, LocalSigner
-from .parser import extract_download_targets, _dump
+from .parser import _dump, extract_download_targets, extract_prepared_doc_target
 from .pipeline import _extract_app_lot_mapping  # reuse temka's robust mapper
 from .state import StateStore, SubmissionState
 from .timing import trace_event, trace_mark
@@ -1022,6 +1022,40 @@ def _first_download_target(html_text: str) -> Optional[tuple[int, str]]:
     return targets[0] if targets else None
 
 
+class DocumentGenerationUnconfirmed(RuntimeError):
+    def __init__(self, app_id: str, doc_id: int):
+        super().__init__(
+            f"Связь прервалась при формировании документа {doc_id}. "
+            f"Проверь черновик {app_id} в кабинете."
+        )
+        self.app_id = app_id
+        self.doc_id = doc_id
+
+
+async def _recover_generated_doc_target(gz, ann, app_id, doc_id) -> tuple[int, str] | None:
+    path = f"/ru/application/show_doc/{ann}/{app_id}/{doc_id}"
+    # A POST with a lost response may already have changed the draft. Consult
+    # only the same document and allow a short delay for its state to appear.
+    try:
+        async with asyncio.timeout(5.0):
+            for attempt in (1, 2):
+                try:
+                    page = await gz._get_page(path, follow_redirects=False)
+                except (SessionExpired, httpx.HTTPStatusError):
+                    return None
+                except httpx.TransportError:
+                    page = ""
+                target = extract_prepared_doc_target(page, doc_id)
+                if target is not None:
+                    log.info("flow.doc.generate_recovered", doc=doc_id, attempt=attempt)
+                    return target
+                if attempt == 1:
+                    await asyncio.sleep(0.25)
+    except TimeoutError:
+        pass
+    return None
+
+
 async def _generate_doc_target(gz, ann, app_id, doc_id, fields, *, hint: str) -> tuple[int, str]:
     """Generate a doc and return (file_id, download_path).
 
@@ -1034,7 +1068,15 @@ async def _generate_doc_target(gz, ann, app_id, doc_id, fields, *, hint: str) ->
     ``download_path`` carries BOTH segments (file_id + access token); downloading
     with only the file_id 403s "Доступ к документу запрещен".
     """
-    r = await gz.show_doc_generate(ann, app_id, doc_id, fields=fields)
+    try:
+        r = await gz.show_doc_generate(ann, app_id, doc_id, fields=fields)
+    except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout,
+            httpx.WriteError, httpx.WriteTimeout) as exc:
+        log.warning("flow.doc.generate_response_lost", doc=doc_id, error_type=type(exc).__name__)
+        target = await _recover_generated_doc_target(gz, ann, app_id, doc_id)
+        if target is not None:
+            return target
+        raise DocumentGenerationUnconfirmed(app_id, doc_id) from exc
     tgt = _first_download_target(r.text)
     if tgt is not None:
         return tgt

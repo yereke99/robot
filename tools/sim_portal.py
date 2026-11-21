@@ -79,6 +79,9 @@ class Portal:
         self.drop_ts_first_save = set(cfg.get("drop_ts_first_save", []))  # тех.спец page nums lost once
         self.ts_attempts: dict[tuple[int, int], int] = {}
         self.bankruptcy_post_has_link = cfg.get("bankruptcy_post_has_link", False)
+        self.agreement_doc = cfg.get("agreement_doc", 3715)
+        self.agreement_disconnect = cfg.get("agreement_disconnect")
+        self.agreement_generation_attempted = False
         self.lock = asyncio.Lock() if cfg.get("session_lock") else None
 
         self.lot_ids = [41000001 + i for i in range(self.lots)]
@@ -129,7 +132,7 @@ class Portal:
             self.sizes[f] = s
         return fids
 
-    async def serve(self, request, latency, check_and_build):
+    async def serve(self, request, latency, check_and_build, *, disconnect=False):
         """Session lock (optional) -> evaluate at arrival -> latency -> commit."""
         t0 = self.now()
         path = request.url.path + (("?" + request.url.query.decode()) if request.url.query else "")
@@ -150,6 +153,9 @@ class Portal:
         else:
             resp = await run()
         entry["t1"] = round(self.now(), 3)
+        if disconnect:
+            entry["status"] = "RemoteProtocolError"
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.", request=request)
         entry["status"] = resp.status_code
         return resp
 
@@ -168,7 +174,7 @@ class Portal:
             (1253, "Приложение 4 (Заявка на участие в конкурсе)"),
             (3359, "Приложение 1 (Сведения о бенефициарном собственнике)"),
             (3334, "Приложение 15 (Техническая спецификация)"),
-            (3715, "Приложение 2 (Соглашение об участии в конкурсе)"),
+            (self.agreement_doc, "Приложение 2 (Соглашение об участии в конкурсе)"),
             (3335, "Приложение 5 (Сведения об отсутствии банкротства)"),
             (3328, "Приложение 19 (Обеспечение заявки)"),
         ]
@@ -186,7 +192,10 @@ class Portal:
             return f"<table>{rows}</table>" + PAD
         if doc in self.generated:
             fid = self.generated[doc]
-            return f'<a href="/files/download_file/{fid}/{fid + 7}/">документ</a>' + PAD
+            return (
+                f'<form method="post"><a href="/files/download_file/{fid}/{fid + 7}/">документ</a>'
+                f'<input type="hidden" name="userfile[{doc}]" value="{fid}"></form>' + PAD
+            )
         return '<input type="submit" name="generate" value="Сформировать документ">' + PAD
 
     def ts_page(self, app_lot: int, num: int) -> str:
@@ -213,7 +222,7 @@ class Portal:
         lotname = "85996082-ОК2"
         if 3359 not in self.signed:
             return f"Подпишите прикрепленный документ в категории Приложение 1 у лота № {lotname}"
-        if 3715 not in self.signed:
+        if self.agreement_doc not in self.signed:
             return "Подпишите прикрепленный документ в категории Приложение 2"
         if 1253 not in self.signed:
             return "Подпишите прикрепленный документ в категории Приложение 4"
@@ -315,7 +324,11 @@ class Portal:
             def build():
                 if self.stage != "docs":
                     return self.redirect_to_stage() if self.stage != "lots" else httpx.Response(200, html="lots")
-                return httpx.Response(200, html=self.docs_page())
+                page = self.docs_page()
+                if self.agreement_disconnect == "after_commit_redirect" and self.agreement_doc in self.generated:
+                    # Even a matching file/form on a redirected page is not confirmation.
+                    page += self.doc_page(self.agreement_doc)
+                return httpx.Response(200, html=page)
             return await self.serve(request, self.docs_get, build)
 
         @r.get(url__regex=rf".*/ru/application/lots/{ANN}/{APP}$")
@@ -333,6 +346,9 @@ class Portal:
                     return self.redirect_to_stage()
                 if doc == 3334:
                     self.parent_get_since_last_ts_save = True
+                if (doc == self.agreement_doc and self.agreement_disconnect == "after_commit_redirect"
+                        and doc in self.generated):
+                    return self.redirect_to_stage()
                 return httpx.Response(200, html=self.doc_page(doc))
             return await self.serve(request, G, build)
 
@@ -362,6 +378,11 @@ class Portal:
             doc = int(request.url.path.rsplit("/", 1)[-1])
             form = dict(parse_qsl(request.content.decode(), keep_blank_values=True))
             sig_keys = [k for k in form if k.startswith("signature[")]
+            disconnect = None
+            if doc == self.agreement_doc and "generate" in form and not sig_keys:
+                if not self.agreement_generation_attempted:
+                    disconnect = self.agreement_disconnect
+                self.agreement_generation_attempted = True
 
             def build():
                 if self.stage != "docs":
@@ -401,10 +422,11 @@ class Portal:
                     def commit():
                         self.generated[doc] = fid
                     page = f'<a href="/files/download_file/{fid}/{fid + 7}/">документ</a>' + PAD
-                    return httpx.Response(200, html=page), commit
+                    response = httpx.Response(200, html=page)
+                    return response if disconnect == "before_commit" else (response, commit)
                 self.bad(f"unrecognised POST show_doc/{doc}: {sorted(form)}")
                 return httpx.Response(200, html="?")
-            return await self.serve(request, P, build)
+            return await self.serve(request, P, build, disconnect=disconnect is not None)
 
         @r.post(url__regex=rf".*/ru/application/show_doc/{ANN}/{APP}/(\d+)/(\d+)/(\d+)/?(\?.*)?$")
         async def lot_post(request):
@@ -639,6 +661,7 @@ async def run_scenario(cfg: dict) -> dict:
         "from_open_s": round(portal.t_public - opened, 2) if portal.t_public else None,
         "requests_after_open": len(after_open),
         "encr_info_calls": portal.encr_calls,
+        "generated_files": portal.generated,
         "save_attempts": portal.save_attempts,
         "log": after_open if cfg.get("want_log") else None,
     }

@@ -142,6 +142,11 @@ def _timing_text(
     """Render the result timings before the report task takes the trace."""
     ts = _BID_TIMESTAMPS.pop(bid_row_id, None) if bid_row_id is not None else None
     tb = flow_repairs.timing_breakdown(ts) if ts else {}
+    trace = _BID_TRACES.get(bid_row_id) if bid_row_id is not None else None
+    if failed and "from_open" not in tb and trace is not None:
+        marks = {phase: at for at, phase in getattr(trace, "marks", ())}
+        if "t0" in marks and marks.get("bid_finished", -1) >= marks["t0"]:
+            tb["from_open"] = round(marks["bid_finished"] - marks["t0"], 1)
     if "from_open" not in tb:
         lines = [f"⏱ <b>Время:</b> {elapsed_total} сек"]
     else:
@@ -159,7 +164,6 @@ def _timing_text(
         if wait is not None and wait >= 1.0:
             lines.append(f"⏳ Ждал открытия тендера: {wait} сек (в расчёт не входит)")
 
-    trace = _BID_TRACES.get(bid_row_id) if bid_row_id is not None else None
     if trace is not None:
         try:
             summary = trace.render_summary(max_chars=_TIMING_SUMMARY_LIMIT)
@@ -822,6 +826,11 @@ async def _run_pipeline(
             error=f"already_prepared: {e}",
         )
         return False, e.app_id, f"already_prepared:{e.app_id}", bid_row_id
+    except flow_repairs.DocumentGenerationUnconfirmed as e:
+        log.warning("flow.doc.generate_unconfirmed", doc=e.doc_id, app_id=e.app_id)
+        ctx.history.finish(bid_row_id, status="failed", app_id=e.app_id, error=str(e))
+        ctx.invalidate_doc_pool()
+        return False, e.app_id, str(e), bid_row_id
     except Exception as e:
         log.exception("pipeline failed")
         ctx.history.finish(bid_row_id, status="failed", error=str(e)[:500])

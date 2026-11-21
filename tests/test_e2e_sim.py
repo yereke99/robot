@@ -38,11 +38,14 @@ def _assert_submitted(result: dict) -> None:
 
 
 def test_clean_bid_runs_the_whole_chain_in_order():
-    result = _run({**FAST, "lag": 0.0})
+    result = _run({**FAST, "lag": 0.0, "want_log": True})
     _assert_submitted(result)
     assert set(result["save_attempts"].values()) == {1}     # every doc saved exactly once
     assert result["encr_info_calls"] == 1
     assert result["from_open_s"] < 11.0
+    agreement_path = f"/ru/application/show_doc/{sim_portal.ANN}/{sim_portal.APP}/3715"
+    agreement_requests = [req for req in result["log"] if req["path"] == agreement_path]
+    assert [(req["m"], req["status"]) for req in agreement_requests] == [("POST", 200), ("POST", 302)]
 
 
 def test_status_only_create_discovers_the_draft_before_selecting_lots():
@@ -89,6 +92,55 @@ def test_lot_documents_start_while_docs_list_is_loading():
     assert mapping["t1"] <= spec["t0"] < docs["t1"]
     assert len(beneficiary_checks) == 1
     assert beneficiary_checks[0]["t0"] < mapping["t1"]
+
+
+def test_lost_agreement_response_continues_using_the_generated_file():
+    doc = 3730
+    result = _run({
+        **FAST, "lag": 0.0, "want_log": True,
+        "agreement_doc": doc, "agreement_disconnect": "after_commit",
+    })
+    _assert_submitted(result)
+
+    ann, app = sim_portal.ANN, sim_portal.APP
+    requests = result["log"]
+    doc_path = f"/ru/application/show_doc/{ann}/{app}/{doc}"
+    doc_requests = [req for req in requests if req["path"] == doc_path]
+    assert [(req["m"], req["status"]) for req in doc_requests] == [
+        ("POST", "RemoteProtocolError"), ("GET", 200), ("POST", 302),
+    ]
+    generate, confirm, sign = doc_requests
+    fid = result["generated_files"][doc]
+    download = next(req for req in requests if req["path"] == f"/files/download_file/{fid}/{fid + 7}/")
+    validate = next(req for req in requests if "/ajax_docs_next/" in req["path"])
+    publish = next(req for req in requests if "/ajax_public_application/" in req["path"])
+    ordered = (generate, confirm, download, sign, validate, publish)
+    assert all(previous["t1"] <= current["t0"] for previous, current in zip(ordered, ordered[1:]))
+    assert sum("/ajax_create_application/" in req["path"] for req in requests) == 1
+    assert result["save_attempts"][doc] == 1
+
+
+@pytest.mark.parametrize(("disconnect", "status"), [("before_commit", 200), ("after_commit_redirect", 302)])
+def test_unconfirmed_agreement_generation_stops_without_repeating_post(disconnect, status):
+    doc = 3730
+    result = _run({
+        **FAST, "lag": 0.0, "want_log": True,
+        "agreement_doc": doc, "agreement_disconnect": disconnect,
+    })
+    assert result["error"].startswith("DocumentGenerationUnconfirmed:")
+    assert result["violations"] == []
+
+    ann, app = sim_portal.ANN, sim_portal.APP
+    requests = result["log"]
+    doc_path = f"/ru/application/show_doc/{ann}/{app}/{doc}"
+    generate, *checks = [req for req in requests if req["path"] == doc_path]
+    assert (generate["m"], generate["status"]) == ("POST", "RemoteProtocolError")
+    assert checks and all((req["m"], req["status"]) == ("GET", status) for req in checks)
+    assert sum("/ajax_create_application/" in req["path"] for req in requests) == 1
+    assert doc not in result["save_attempts"]
+    assert not any("/ajax_docs_next/" in req["path"] or "/priceoffers/" in req["path"] for req in requests)
+    assert result["encr_info_calls"] == 0
+    assert result["to_public_request_s"] is None
 
 
 def test_dry_run_prices_the_application_without_publishing():
