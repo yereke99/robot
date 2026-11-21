@@ -258,7 +258,11 @@ async def _post_shutdown(application: Application) -> None:
 
 def main() -> int:
     config_path = Path(os.environ.get("BOT_CONFIG_PATH", "config.yaml"))
-    cfg = bot_config.load(config_path)
+    try:
+        cfg = bot_config.load(config_path)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     try:
         with bot_instance(cfg.telegram.bot_token):
             managed = os.environ.get("GOSZAKUP_MANAGED_START") == "1"

@@ -81,7 +81,10 @@ def _report_chat_id(raw_telegram: dict) -> int | None:
 
 def load(config_path: Path = Path("config.yaml")) -> BotConfig:
     if not config_path.exists():
-        raise RuntimeError(f"config not found: {config_path}")
+        raise RuntimeError(
+            f"Не найден файл настроек {config_path.resolve()}. "
+            "Перенеси рабочий config.yaml в папку проекта или задай BOT_CONFIG_PATH."
+        )
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
     tg = raw.get("telegram") or {}

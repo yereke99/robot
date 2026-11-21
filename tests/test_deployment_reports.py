@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 import sys
 from contextlib import nullcontext
@@ -118,12 +119,74 @@ def test_windows_launcher_requires_update_before_spawning_python(monkeypatch):
     monkeypatch.setattr(windows_run.sys, "argv", ["windows_run"])
     update = Mock(side_effect=git_sync.GitSyncError("pull_failed"))
     monkeypatch.setattr(windows_run, "update_main", update)
+    prepare = Mock()
+    monkeypatch.setattr(windows_run, "prepare_python", prepare)
     child = Mock()
     monkeypatch.setattr(windows_run.subprocess, "Popen", child)
 
     assert windows_run.main() == 1
     update.assert_called_once()
+    prepare.assert_not_called()
     child.assert_not_called()
+
+
+def test_prepare_python_installs_from_the_new_checkout_once(tmp_path, monkeypatch):
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("structlog>=24.1\n", encoding="utf-8")
+    relative_python = "Scripts/python.exe" if os.name == "nt" else "bin/python"
+    python = tmp_path / ".venv" / relative_python
+
+    def run(command, **kwargs):
+        assert kwargs["cwd"] == tmp_path
+        if command[1:3] == ["-m", "venv"]:
+            python.parent.mkdir(parents=True)
+            python.touch()
+        return subprocess.CompletedProcess(command, 0)
+
+    launcher = Mock(side_effect=run)
+    monkeypatch.setattr(windows_run.subprocess, "run", launcher)
+
+    assert windows_run.prepare_python(tmp_path) == python
+    actions = [call.args[0][1:3] for call in launcher.call_args_list]
+    assert actions == [["-m", "venv"], ["-c", "import pip"], ["-m", "pip"],
+                       ["-c", "from goszakup.bot import main"]]
+
+    launcher.reset_mock()
+    assert windows_run.prepare_python(tmp_path) == python
+    assert launcher.call_count == 1
+    assert launcher.call_args.args[0][1:] == ["-c", "from goszakup.bot import main"]
+
+    launcher.reset_mock()
+    requirements.write_text("structlog>=25.0\n", encoding="utf-8")
+    assert windows_run.prepare_python(tmp_path) == python
+    actions = [call.args[0][1:3] for call in launcher.call_args_list]
+    assert actions == [["-c", "import pip"], ["-m", "pip"], ["-c", "from goszakup.bot import main"]]
+
+
+def test_windows_launcher_stops_when_dependency_installation_fails(monkeypatch):
+    monkeypatch.setattr(windows_run, "bot_instance", lambda _: nullcontext())
+    monkeypatch.setattr(windows_run.sys, "argv", ["windows_run"])
+    monkeypatch.setattr(windows_run, "update_main", lambda _: "5" * 40)
+    prepare = Mock(side_effect=subprocess.CalledProcessError(1, ["pip", "install"]))
+    monkeypatch.setattr(windows_run, "prepare_python", prepare)
+    child = Mock()
+    monkeypatch.setattr(windows_run.subprocess, "Popen", child)
+
+    assert windows_run.main() == 1
+    prepare.assert_called_once()
+    child.assert_not_called()
+
+
+def test_missing_bot_config_shows_setup_message_without_starting_bot(tmp_path, monkeypatch, capsys):
+    from goszakup.bot import main as bot_main
+
+    monkeypatch.setenv("BOT_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    launch = Mock()
+    monkeypatch.setattr(bot_main, "_run_bot", launch)
+
+    assert bot_main.main() == 1
+    assert "Перенеси рабочий config.yaml" in capsys.readouterr().err
+    launch.assert_not_called()
 
 
 def test_windows_finds_git_with_a_stale_path(tmp_path, monkeypatch):

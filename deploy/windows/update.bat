@@ -6,28 +6,10 @@ setlocal
 cd /d "%~dp0..\.."
 
 echo.
-echo === git pull --ff-only origin main ===
-".venv\Scripts\python.exe" -m goszakup.bot.windows_run --update-only
+echo === updating origin/main and Python dependencies ===
+call "%~dp0launch-python.bat" --update-only
 if errorlevel 1 (
     echo [update] Update failed. Review the message above before retrying.
-    pause
-    exit /b 1
-)
-
-echo.
-echo === installing/updating Python deps ===
-.venv\Scripts\pip.exe install -r requirements.txt
-if errorlevel 1 (
-    echo [update] pip install failed. Check the message above.
-    pause
-    exit /b 1
-)
-
-echo.
-echo === smoke check (just imports) ===
-.venv\Scripts\python.exe -c "from goszakup.bot import main; print('imports OK')"
-if errorlevel 1 (
-    echo [update] post-update import check failed.
     pause
     exit /b 1
 )

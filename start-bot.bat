@@ -19,33 +19,7 @@ title ATAGOS bot (Administrator)
 echo.
 echo === ATAGOS / ADMIN ===
 
-set "ATAGOS_PYTHON=%~dp0.venv\Scripts\python.exe"
-set "ATAGOS_PYTHON_ARGS="
-if exist "%ATAGOS_PYTHON%" goto :run
-
-where py.exe >nul 2>&1
-if not errorlevel 1 (
-  set "ATAGOS_PYTHON=py.exe"
-  set "ATAGOS_PYTHON_ARGS=-3"
-  goto :run
-)
-where python.exe >nul 2>&1
-if errorlevel 1 (
-  echo [start-bot] Python is missing. Run deploy\windows\install.ps1.
-  set "ATAGOS_EXIT_CODE=1"
-  goto :hold
-)
-set "ATAGOS_PYTHON=python.exe"
-
-:run
-echo Using Python: "%ATAGOS_PYTHON%" %ATAGOS_PYTHON_ARGS%
-"%ATAGOS_PYTHON%" %ATAGOS_PYTHON_ARGS% -c "import sys; sys.exit(sys.version_info < (3, 11))"
-if errorlevel 1 (
-  echo [start-bot] Python 3.11 or newer is required. Run deploy\windows\install.ps1.
-  set "ATAGOS_EXIT_CODE=1"
-  goto :hold
-)
-"%ATAGOS_PYTHON%" %ATAGOS_PYTHON_ARGS% -m goszakup.bot.windows_run
+call "%~dp0deploy\windows\launch-python.bat"
 set "ATAGOS_EXIT_CODE=%ERRORLEVEL%"
 echo.
 echo Bot stopped. Exit code %ATAGOS_EXIT_CODE%.
