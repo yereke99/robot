@@ -110,7 +110,7 @@ defaults:
   # сам переподпишет её (уже с барьером): ошибка стоит секунд, а не заявки.
   lot_barrier: each
 
-# Telegram-бот — только для `python -m goszakup.bot.atagos_bot`.
+# Telegram-бот.
 telegram:
   # Проще всего: впиши токен от @BotFather прямо сюда.
   bot_token: ""                     # напр. "123456789:AAE...тут_весь_токен"
@@ -120,8 +120,10 @@ telegram:
   bot_token_env: TG_BOT_TOKEN
   allowed_user_ids: []              # числовые Telegram user_id с доступом
   admin_user_ids: []                # опционально; получают уведомления о попытках доступа
-  # Кому ещё слать файл-отчёт о каждой подаче (числовые Telegram ID). Человек должен
-  # один раз нажать Start в боте, иначе Telegram не доставит.
+  # При запуске через start-bot.bat укажи один личный Telegram ID для файлов
+  # запуска, остановки и подачи или задай GOSZAKUP_REPORT_CHAT_ID в .env.
+  # Получатель должен один раз нажать Start в личном чате с ботом.
+  # При прямом запуске Python эти ID получают копии файлов замеров.
   report_chat_ids: []
 
 search:                             # имена параметров = filter[...] из URL поиска goszakup

@@ -66,17 +66,31 @@ _BID_TRACES: dict[int, BidTrace] = {}
 _LAST_REPORT: dict[int, tuple[str, str]] = {}
 
 
-async def _send_timing_report(ctx, bot, chat_id, bid_row_id, announce_id, app_id) -> None:
-    """After a bid: send its per-request timeline as a text file to the chat that
-    started it and keep a copy under <log_dir>/timing/. Runs after the result is
-    known, so it never slows a submission. Off: defaults.send_timing_report: false
-    (the file is still written and /timing still works)."""
+async def _send_timing_report(
+    ctx, bot, chat_id, bid_row_id, announce_id, app_id, *, result="failed",
+) -> None:
+    """Send the per-request timeline after a bid and save it for /timing."""
     trace = _BID_TRACES.pop(bid_row_id, None)
-    if trace is None:
-        return
+    if trace is not None:
+        await deliver_timing_report(ctx, bot, chat_id, trace, announce_id, app_id, result=result)
+
+
+async def deliver_timing_report(
+    ctx, bot, chat_id, trace: BidTrace, announce_id, app_id, *,
+    result: str, scheduled_elapsed: float | None = None,
+) -> None:
+    reports = getattr(ctx, "run_reports", None)
     try:
-        text = trace.render(title=f"Тендер #{announce_id} · app {app_id or '—'}")
-        name = f"timing_{announce_id}_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+        git_name = await reports.save_bid(trace, result, scheduled_elapsed) if reports is not None else None
+        title = f"Тендер #{announce_id} · app {app_id or '—'}"
+        if scheduled_elapsed is not None:
+            title += f"\nОт T0 по расписанию {scheduled_elapsed:.2f} с"
+        text = trace.render(title=title)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        if git_name:
+            text = f"Имя файла в GitHub {git_name}\n\n{text}"
+            stamp += "_" + git_name.rsplit("_", 1)[-1].removesuffix(".txt")
+        name = f"timing_{announce_id}_{stamp}.txt"
         _LAST_REPORT[chat_id] = (name, text)
         config = getattr(ctx, "config", None)
         log_dir = getattr(config, "log_dir", None)
@@ -87,12 +101,11 @@ async def _send_timing_report(ctx, bot, chat_id, bid_row_id, announce_id, app_id
             (folder / name).write_text(text, encoding="utf-8")
         raw = getattr(config, "raw", None) or {}
         if raw.get("defaults", {}).get("send_timing_report", True):
-            # The operator's chat + everyone in telegram.report_chat_ids. (A user
-            # must have pressed Start in the bot once, or Telegram refuses.)
-            recipients = [chat_id]
-            for extra in (raw.get("telegram") or {}).get("report_chat_ids") or []:
-                if int(extra) not in recipients:
-                    recipients.append(int(extra))
+            if reports is not None:
+                recipients = [reports.chat_id] if reports.chat_id is not None else []
+            else:
+                extra_chats = (raw.get("telegram") or {}).get("report_chat_ids") or []
+                recipients = list(dict.fromkeys([chat_id, *map(int, extra_chats)]))
             for target in recipients:
                 try:
                     await bot.send_document(
@@ -101,9 +114,18 @@ async def _send_timing_report(ctx, bot, chat_id, bid_row_id, announce_id, app_id
                         caption=f"⏱ Отчёт о подаче #{announce_id}: запросы, время, журнал",
                     )
                 except Exception as e:  # noqa: BLE001 — one unreachable chat must not stop the rest
-                    log.warning("bid.timing_report.send_failed", chat=target, err=str(e)[:120])
+                    log.warning("bid.timing_report.send_failed", error_type=type(e).__name__)
     except Exception as e:  # noqa: BLE001 — diagnostics must never break a bid
-        log.warning("bid.timing_report.failed", err=str(e)[:120])
+        log.warning("bid.timing_report.failed", error_type=type(e).__name__)
+
+
+def _queue_timing_report(context, ctx, chat_id, row_id, announce_id, app_id, *, ok: bool, dry: bool) -> None:
+    result = "dry_run_complete" if dry else "public_ok" if ok else "failed"
+    report = _send_timing_report(ctx, context.bot, chat_id, row_id, announce_id, app_id, result=result)
+    if getattr(ctx, "run_reports", None) is not None:
+        context.application.create_task(report)
+    else:
+        asyncio.ensure_future(report)
 
 
 _PHASE_LABELS = (
@@ -497,8 +519,7 @@ async def _multi_bid(
             elapsed_multi = round(time.monotonic() - started_at, 1)
             is_dry = err == "dry_run_complete"
             elapsed_text = _timing_text(row_id, elapsed_multi, dry=is_dry, failed=not ok)
-            asyncio.ensure_future(_send_timing_report(
-                ctx, context.bot, chat_id, row_id, announce_id, app_id))
+            _queue_timing_report(context, ctx, chat_id, row_id, announce_id, app_id, ok=ok, dry=is_dry)
             if ok:
                 headline = ("dry-run OK, <b>НЕ подана</b>" if is_dry else "заявка подана!")
                 await pm.finish(
@@ -923,8 +944,8 @@ async def _do_submit(
 
     elapsed_val = round(time.monotonic() - t_bid0, 1)
     elapsed_str = _timing_text(bid_row_id, elapsed_val, dry=(err == "dry_run_complete"), failed=not ok)
-    asyncio.ensure_future(_send_timing_report(
-        ctx, context.bot, chat_id, bid_row_id, announce_id, app_id))
+    _queue_timing_report(context, ctx, chat_id, bid_row_id, announce_id, app_id,
+                         ok=ok, dry=err == "dry_run_complete")
 
     if not ok:
         if err and err.startswith("already_prepared:"):

@@ -16,16 +16,19 @@ from __future__ import annotations
 import logging
 import queue
 import re
+from collections import deque
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from logging.handlers import QueueListener, RotatingFileHandler
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from urllib.parse import urlsplit
 
 import structlog
 
 from .. import timing
-from ..timing import HttpTiming, current_trace, portal_trace_path
+from ..timing import BidTrace, HttpTiming, current_trace, portal_trace_path
 from .progress import current_progress
 
 
@@ -176,6 +179,100 @@ _RUNTIME_OPERATIONS = {
 }
 _LOG_LEVELS = {"debug", "info", "warning", "error", "critical"}
 _HTTP_STATUS = re.compile(r"(?:[0-9]{3}(?:/[A-Za-z]+)?|[A-Za-z]{1,40})")
+_PUBLIC_EVENTS = {
+    "bot.starting", "bot.ready", "bot.signer_ready", "bot.portal_prewarm",
+    "bot.portal_prewarm_failed", "telegram.polling_error", "telegram.startup_failed",
+    "flow.timing", "flow.timing.summary", "pipeline.timing", "flow.docs_next",
+    "flow.docs_next.retry", "flow.docs_next.resaved", "flow.gamma.done",
+    "local_signer.range.eligibility", "local_signer.range.used",
+    "http.response", *(f"operation.{kind}" for kind in _RUNTIME_OPERATIONS),
+}
+_PUBLIC_NUMBERS = _TRACE_DURATION_FIELDS | {
+    "bytes", "attempt", "accepted", "ok", "headers_s", "body_s", "tcp_s", "tls_s",
+}
+_PUBLIC_PHASES = {
+    "t0", "created", "lots_selected", "lots_done", "docs_signed", "docs_accepted",
+    "docs_ready", "gamma_start", "gamma_done", "signed", "dry_run_complete",
+    "public_start", "public_done", "bid_finished",
+}
+_PUBLIC_HTTP_ERRORS = {
+    "CancelledError", "ConnectError", "ConnectTimeout", "PoolTimeout", "ProxyError",
+    "ReadError", "ReadTimeout", "RemoteProtocolError", "WriteError", "WriteTimeout", "closed",
+}
+_PUBLIC_RESULTS = {
+    "public_ok": "Заявка подана",
+    "dry_run_complete": "Черновик готов",
+    "submit_declined": "Подача отменена",
+    "already_prepared": "Заявка уже подготовлена",
+    "public_error": "Портал отклонил заявку",
+    "failed": "Попытка завершилась ошибкой",
+}
+
+
+def _public_route(value: str) -> str:
+    return re.sub(r"/[0-9]+(?=/|$)", "", portal_trace_path(value))
+
+
+def _public_http_status(status: str) -> str:
+    if status in _PUBLIC_HTTP_ERRORS:
+        return status
+    code, _, error = status.partition("/")
+    if re.fullmatch(r"[1-5][0-9]{2}", code):
+        return status if error in _PUBLIC_HTTP_ERRORS else code
+    return ""
+
+
+def _public_fields(event: str, fields: tuple[str, ...]) -> Iterator[str]:
+    """Keep numeric measurements and known operation labels for public Git."""
+    for field in fields:
+        name, _, value = field.partition("=")
+        if name in _PUBLIC_NUMBERS and re.fullmatch(r"[0-9.]+|True|False", value):
+            yield field
+        elif name == "route":
+            yield f"route={_public_route(value)}"
+        elif name == "phase" and value in _PUBLIC_PHASES:
+            yield field
+        elif name == "step" and value in {"public_ok", "public_error", "dry_run_complete", "docs_ready"}:
+            yield field
+        elif name == "method" and value in _RUNTIME_HTTP_METHODS:
+            yield field
+        elif name == "status" and (status := _public_http_status(value)):
+            yield f"status={status}"
+        elif name == "name" and value in _RUNTIME_OPERATIONS.get(event.removeprefix("operation."), ()):
+            yield field
+        elif name == "protocol" and re.fullmatch(r"HTTP/[0-9.]{1,3}", value):
+            yield field
+        elif name == "error_type" and value in {"dns", "other_poller", "conflict", "NetworkError"}:
+            yield field
+
+
+def public_bid_report(trace: BidTrace, result: str, scheduled_elapsed: float | None = None) -> str:
+    """Render the standard timing report using only public measurements."""
+    public = BidTrace()
+    public.wall0 = trace.wall0
+    public.marks = [(at, phase) for at, phase in trace.marks if phase in _PUBLIC_PHASES]
+    for event in trace._events():
+        if event.kind in _RUNTIME_HTTP_METHODS:
+            name = _public_route(event.name)
+        elif event.name in _RUNTIME_OPERATIONS.get(event.kind, ()):
+            name = event.name
+        else:
+            continue
+        http = event.http
+        if http and not re.fullmatch(r"HTTP/[0-9.]{1,3}", http.version):
+            http = http._replace(version="")
+        public.events.append(event._replace(name=name, status=_public_http_status(event.status), http=http))
+
+    title = _PUBLIC_RESULTS.get(result, _PUBLIC_RESULTS["failed"])
+    if scheduled_elapsed is not None:
+        title += f"\nОт T0 по расписанию {scheduled_elapsed:.2f} с"
+    else:
+        start = next((at for at, phase in public.marks if phase == "t0"), None)
+        finish = next((at for at, phase in reversed(public.marks)
+                       if phase in {"public_done", "dry_run_complete", "bid_finished"}), None)
+        if start is not None and finish is not None:
+            title += f"\nОт открытия до завершения {finish - start:.2f} с"
+    return public.render(title=title)
 
 
 class _RuntimeQueueListener(QueueListener):
@@ -187,13 +284,18 @@ class _RuntimeQueueListener(QueueListener):
 class RuntimeLog:
     """Rotating, sanitized UTF-8 diagnostics independent of the launch console."""
 
-    def __init__(self, log_dir: Path, *, max_bytes: int = 2_000_000, backups: int = 3):
+    def __init__(
+        self, log_dir: Path, *, max_bytes: int = 2_000_000, backups: int = 3,
+        capture_reports: bool = False,
+    ):
         log_dir.mkdir(parents=True, exist_ok=True)
         self._handler = RotatingFileHandler(log_dir / "runtime.log", maxBytes=max_bytes,
                                             backupCount=backups, encoding="utf-8", delay=True)
         self._queue: queue.Queue[logging.LogRecord] = queue.Queue(maxsize=4096)
         self._listener = _RuntimeQueueListener(self._queue, self._handler)
         self._closed = False
+        self._reports = deque(maxlen=3000) if capture_reports else None
+        self._reports_lock = Lock()
         self._listener.start()
         self._sink = self.record_operation
         timing.runtime_event_sink = self._sink
@@ -202,16 +304,32 @@ class RuntimeLog:
         if self._closed:
             return
         timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-        entries = [timestamp, level if level in _LOG_LEVELS else "info", event]
+        level = level if level in _LOG_LEVELS else "info"
+        entries = [timestamp, level, event]
         if re.fullmatch(r"#[0-9]{1,20}", label):
             entries.append(f"tender={label[1:]}")
+        line = " ".join(entries + fields)
+        if self._reports is not None:
+            with self._reports_lock:
+                self._reports.append((timestamp, level, event, tuple(fields), line))
         record = logging.LogRecord("goszakup.runtime", logging.INFO, "", 0,
-                                   " ".join(entries + fields), (), None)
+                                   line, (), None)
         try:
             self._queue.put_nowait(record)
         except queue.Full:
             # A blocked diagnostics disk must not stall bidding.
             pass
+
+    def report_logs(self) -> tuple[str, str]:
+        """Return the current run's detailed Telegram log and anonymous Git log."""
+        with self._reports_lock:
+            events = tuple(self._reports or ())
+        detailed = "\n".join(line for _, _, _, _, line in events)
+        public = "\n".join(
+            " ".join((timestamp, level, event, *_public_fields(event, fields)))
+            for timestamp, level, event, fields, _ in events if event in _PUBLIC_EVENTS
+        )
+        return detailed, public
 
     def process(self, logger, method_name, event_dict):
         """Copy selected structured events without altering console processing."""

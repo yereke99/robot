@@ -13,7 +13,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 _cache_log = logging.getLogger("ctx.cache")
 
@@ -21,6 +21,9 @@ from ..client import GoszakupClient
 from ..local_signer import KalkanSigner
 from .config import BotConfig
 from .history_db import HistoryDB
+
+if TYPE_CHECKING:
+    from .run_reports import RunReports
 
 
 @dataclass
@@ -48,6 +51,7 @@ class BotContext:
     # macOS Keychain `security` subprocess calls are ~300-700ms each;
     # reading them on every bid added ~2s of wall-clock latency.
     account_password: Optional[str] = None
+    run_reports: Optional[RunReports] = field(default=None, kw_only=True)
     # Opt #4: single long-lived GoszakupClient for the entire bot lifetime.
     # Pre-warmed at startup so the bid hot-path skips TLS+HTTP/2 handshake.
     # Single-tenant invariant guarantees the cookie jar isn't shared between

@@ -1,16 +1,15 @@
 @echo off
-REM Pull the latest code + update Python deps. Run after every release.
-REM Stops the bot first if it's running via the run-bot.bat console window.
+REM Update the checkout and Python dependencies after stopping the bot.
 
 chcp 65001 >nul
 setlocal
 cd /d "%~dp0..\.."
 
 echo.
-echo === git pull ===
-git pull --rebase --autostash
+echo === git pull --ff-only origin main ===
+".venv\Scripts\python.exe" -m goszakup.bot.windows_run --update-only
 if errorlevel 1 (
-    echo [update] git pull failed. Resolve conflicts then re-run.
+    echo [update] Update failed. Review the message above before retrying.
     pause
     exit /b 1
 )

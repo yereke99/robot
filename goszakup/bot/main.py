@@ -44,13 +44,14 @@ from .handlers import common
 from .handlers import settings as settings_handler
 from .history_db import HistoryDB
 from .instance_lock import BotAlreadyRunning, bot_instance
+from .run_reports import RunReports
 from .texts import BOT_COMMANDS_RU
 
 log = structlog.get_logger("bot")
 
 
-def _setup_logging(log_dir: Path) -> log_capture.RuntimeLog:
-    runtime_log = log_capture.RuntimeLog(log_dir)
+def _setup_logging(log_dir: Path, *, capture_reports: bool = False) -> log_capture.RuntimeLog:
+    runtime_log = log_capture.RuntimeLog(log_dir, capture_reports=capture_reports)
     logging.basicConfig(
         level=logging.INFO,
         format="%(message)s",
@@ -214,12 +215,23 @@ async def _post_init(application: Application) -> None:
     except Exception:
         pass
     log.info("bot.ready", count=len(ctx.config.telegram.allowed_user_ids))
+    reports = getattr(ctx, "run_reports", None)
+    if reports is not None:
+        reports.start(application)
+
+
+async def _post_stop(application: Application) -> None:
+    reports = application.bot_data["ctx"].run_reports
+    if reports is not None:
+        await reports.stop()
 
 
 async def _post_shutdown(application: Application) -> None:
     ctx: BotContext = application.bot_data.get("ctx")
     if ctx is None:
         return
+    if ctx.run_reports is not None:
+        await ctx.run_reports.cancel()
     hb = application.bot_data.get("heartbeat_task")
     if hb is not None:
         hb.cancel()
@@ -249,12 +261,23 @@ def main() -> int:
     cfg = bot_config.load(config_path)
     try:
         with bot_instance(cfg.telegram.bot_token):
-            runtime_log = _setup_logging(cfg.log_dir)
+            managed = os.environ.get("GOSZAKUP_MANAGED_START") == "1"
+            chat_id = cfg.telegram.report_chat_id
+            runtime_log = _setup_logging(cfg.log_dir, capture_reports=managed)
             try:
+                reports = None
+                if managed:
+                    reports = RunReports(
+                        runtime_log, cfg.log_dir, chat_id,
+                        repo=Path(__file__).resolve().parents[2],
+                        revision=os.environ.get("GOSZAKUP_RUN_REVISION", ""),
+                    )
+                    if chat_id is None:
+                        log.warning("bot.run_report_chat_missing")
                 log.info("bot.starting", pid=os.getpid(), platform=sys.platform,
                          python=sys.version.split()[0],
                          pipeline_type=cfg.raw.get("defaults", {}).get("pipeline_type", "catering"))
-                return _run_bot(cfg)
+                return _run_bot(cfg, reports)
             except TelegramError as e:
                 log.error("telegram.startup_failed", error_type=_telegram_error_type(e))
                 return 1
@@ -265,7 +288,7 @@ def main() -> int:
         return 1
 
 
-def _run_bot(cfg: bot_config.BotConfig) -> int:
+def _run_bot(cfg: bot_config.BotConfig, reports: RunReports | None = None) -> int:
 
     # Resolve ECP password and start the Java signer once for the whole process.
     ecp_pw = gz_secrets.get(cfg.ecp_password_service, cfg.ecp_password_account)
@@ -294,7 +317,7 @@ def _run_bot(cfg: bot_config.BotConfig) -> int:
         )
     ctx = BotContext(
         config=cfg, signer=signer, history=history_db,
-        account_password=acc_pw,
+        account_password=acc_pw, run_reports=reports,
     )
     # Seed runtime bid settings (guarantee type, confirm-before-submit, price
     # floor, dry-run) from config.yaml defaults; editable live via /config.
@@ -305,6 +328,7 @@ def _run_bot(cfg: bot_config.BotConfig) -> int:
         .token(cfg.telegram.bot_token)
         .defaults(Defaults(parse_mode=None, block=False))
         .post_init(_post_init)
+        .post_stop(_post_stop)
         .post_shutdown(_post_shutdown)
         .build()
     )

@@ -7,6 +7,7 @@ ECP paths, base URL, etc.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -19,6 +20,7 @@ class TelegramConfig:
     bot_token: str
     allowed_user_ids: frozenset[int]
     admin_user_ids: frozenset[int]
+    report_chat_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,20 @@ def _resolve_token(raw_telegram: dict) -> str:
     return token
 
 
+def _report_chat_id(raw_telegram: dict) -> int | None:
+    override = os.environ.get("GOSZAKUP_REPORT_CHAT_ID", "").strip()
+    if override:
+        if not re.fullmatch(r"[1-9][0-9]{0,15}", override):
+            raise ValueError("GOSZAKUP_REPORT_CHAT_ID must be a personal Telegram chat ID")
+        return int(override)
+    configured = raw_telegram.get("report_chat_ids") or []
+    if isinstance(configured, list) and len(configured) == 1 and re.fullmatch(
+        r"[1-9][0-9]{0,15}", str(configured[0])
+    ):
+        return int(configured[0])
+    return None
+
+
 def load(config_path: Path = Path("config.yaml")) -> BotConfig:
     if not config_path.exists():
         raise RuntimeError(f"config not found: {config_path}")
@@ -102,6 +118,7 @@ def load(config_path: Path = Path("config.yaml")) -> BotConfig:
             bot_token=_resolve_token(tg),
             allowed_user_ids=allowed,
             admin_user_ids=admins,
+            report_chat_id=_report_chat_id(tg),
         ),
         search=SearchConfig(
             statuses=statuses,

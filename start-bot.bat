@@ -45,7 +45,7 @@ if errorlevel 1 (
   set "ATAGOS_EXIT_CODE=1"
   goto :hold
 )
-"%ATAGOS_PYTHON%" %ATAGOS_PYTHON_ARGS% -m goszakup.bot.main
+"%ATAGOS_PYTHON%" %ATAGOS_PYTHON_ARGS% -m goszakup.bot.windows_run
 set "ATAGOS_EXIT_CODE=%ERRORLEVEL%"
 echo.
 echo Bot stopped. Exit code %ATAGOS_EXIT_CODE%.

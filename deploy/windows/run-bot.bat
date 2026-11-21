@@ -1,6 +1,6 @@
 @echo off
 REM Run the goszakup Telegram bot on Windows.
-REM Loads .env (TG_BOT_TOKEN + ECP/ACCOUNT passwords) and execs python.
+REM Updates origin/main, then starts Python with the working machine's .env.
 REM Double-click to start, or use as the Task Scheduler trigger for autostart.
 
 REM Switch console codepage to UTF-8 so Russian text in logs doesn't garble.
@@ -30,7 +30,7 @@ set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
 
 REM python-dotenv (loaded inside goszakup.bot.main) parses the .env itself.
-".venv\Scripts\python.exe" -m goszakup.bot.main
+".venv\Scripts\python.exe" -m goszakup.bot.windows_run
 set "ATAGOS_EXIT_CODE=%ERRORLEVEL%"
 echo [run-bot] Bot stopped. Exit code %ATAGOS_EXIT_CODE%.
 

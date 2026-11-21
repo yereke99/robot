@@ -45,12 +45,13 @@ from telegram.ext import CommandHandler, ContextTypes
 from ..auth import whitelist_only
 from ..context import BotContext
 from . import settings as settings_handler
+from .bid import deliver_timing_report
 from ... import flow as flow_repairs
 from ...client import GoszakupClient
 from ...flow import AtagosBidParams, BeneficiaryInfo
 from ...local_signer import LocalSigner
 from ...state import StateStore
-from ...timing import poll_interval_s
+from ...timing import BidTrace, current_trace, poll_interval_s
 
 log = structlog.get_logger("scheduled")
 
@@ -451,7 +452,9 @@ async def _run_scheduled(ctx: BotContext, tenders: list[ScheduledTender],
     defaults = ctx.config.raw.get("defaults", {})
     fast_t0 = bool(defaults.get("fast_t0", True))
 
-    async def _handle_one(tender: ScheduledTender, notify: Callable[[str], None]):
+    async def _handle_one(
+        tender: ScheduledTender, notify: Callable[[str], None],
+    ) -> tuple[str, str | None, float | None]:
         now = _now()
         # Anchor wall-clock T0 to the monotonic clock before warmup/prepare.
         # Starting the timer at phase 2 omitted documents completed after T0.
@@ -502,7 +505,7 @@ async def _run_scheduled(ctx: BotContext, tenders: list[ScheduledTender],
                     f"⚠️ <b>#{tender.announce_id}</b> — ошибка прогрева: {e}\n"
                     "Ставка пропущена."
                 )
-                return
+                return "failed", None, None
 
             app_id: str | None = None
 
@@ -574,6 +577,7 @@ async def _run_scheduled(ctx: BotContext, tenders: list[ScheduledTender],
                           f"<code>{detail[:300]}</code>")
             phase = "фаза подготовки" if status == "dry_run_complete" else "фаза подачи"
             notify(f"{result}\n⏱ {elapsed}с от T0 ({mode}); {phase}: {phase2_elapsed}с")
+            return status, detail if status in ("public_ok", "dry_run_complete") else app_id, elapsed
 
     async def _handle_with_notifications(tender: ScheduledTender):
         # One sender per tender preserves message order without waiting for
@@ -590,8 +594,21 @@ async def _run_scheduled(ctx: BotContext, tenders: list[ScheduledTender],
 
         sender = asyncio.create_task(_send_updates())
         try:
-            await _handle_one(tender, updates.put_nowait)
+            trace = BidTrace(f"#{tender.announce_id}") if getattr(ctx, "run_reports", None) else None
+            token = current_trace.set(trace) if trace is not None else None
+            try:
+                status, app_id, elapsed = await _handle_one(tender, updates.put_nowait)
+            finally:
+                if token is not None:
+                    current_trace.reset(token)
             updates.put_nowait(None)
+            if trace is not None:
+                if not any(phase in {"public_done", "dry_run_complete"} for _, phase in trace.marks):
+                    trace.mark("bid_finished")
+                await deliver_timing_report(
+                    ctx, bot, chat_id, trace, tender.announce_id, app_id,
+                    result=status, scheduled_elapsed=elapsed,
+                )
             await sender
         finally:
             if not sender.done():

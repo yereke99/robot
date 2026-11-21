@@ -14,6 +14,7 @@
 - Пароль от кабинета goszakup
 - Telegram bot token (от [@BotFather](https://t.me/BotFather))
 - Telegram user_id людей которым можно бидить (через [@userinfobot](https://t.me/userinfobot))
+- Учётная запись GitHub с правом записи в ветку main репозитория origin для отправки отчётов
 
 ## 1. Установка (5 мин)
 
@@ -49,6 +50,9 @@ notepad config.yaml
 - `company.subject_address`, `iik`, `contact_phone` — данные из кабинета
 - `ecp.p12_path` → `C:\goszakup-bot\secrets\ecp.p12`
 - `telegram.allowed_user_ids` — список Telegram user_id (числа)
+- `telegram.report_chat_ids` — один личный Telegram ID для отчётов о работе и
+  файлов замеров после подачи. Если ID уже указан, сохрани его при переносе
+  `config.yaml` на Windows. `GOSZAKUP_REPORT_CHAT_ID` в `.env` переопределяет его.
 - `search.statuses` и `search.methods` — фильтры тендеров (по умолчанию
   питание воспитанников + статусы «опубликован» и «приём заявок»)
 
@@ -80,12 +84,23 @@ GOSZAKUP_GOSZAKUP_ACC_DEFAULT=<пароль кабинета goszakup>
 
 ## 3. Первый запуск (проверка)
 
+До первого запуска проверь доступ к GitHub из учётной записи Windows, под
+которой будет работать бот. Для входа через Git Credential Manager выполни
+`git push --dry-run origin main` из папки проекта и заверши вход в браузере,
+если GitHub его запросит.
+
 Для подачи с автозаполнением окна TumarCSP запусти `start-bot.bat` из корня
 проекта и подтверди запрос Windows на запуск от администратора. Скрипт
 использует `.venv\Scripts\python.exe`, если виртуальное окружение создано.
-В консоли должно появиться:
+Каждый запуск сначала выполняет `git pull --ff-only --no-rebase origin main`.
+Бот стартует после успешного обновления чистой ветки `main`. При ошибке Git,
+изменениях в отслеживаемых файлах или локальных коммитах, которых нет в
+`origin/main`, скрипт остановится и покажет причину.
+
+После успешного запуска в консоли появятся строки
 
 ```
+origin/main updated: ...
 [info] bot.starting pid=XXXX
 [info] bot.signer_ready elapsed_ms=...
 [info] bot.portal_prewarm elapsed_ms=...
@@ -93,9 +108,11 @@ GOSZAKUP_GOSZAKUP_ACC_DEFAULT=<пароль кабинета goszakup>
 ```
 
 После строки `bot.ready` отправь `/start` и дождись ответа в Telegram. Это
-подтвердит, что бот получает обновления.
+подтвердит, что бот получает обновления. Получатель отчётов должен один раз
+открыть личный чат с ботом и нажать **Старт**, чтобы бот мог присылать файлы.
 
 Чтобы остановить интерактивный запуск, нажми Ctrl+C в окне этого бота.
+Дождись завершения, чтобы бот успел отправить итоговый отчёт.
 Запускай одну копию на токен. Если используется Планировщик задач или служба,
 останови её перед запуском через `start-bot.bat`.
 
@@ -108,6 +125,8 @@ cd C:\goszakup-bot
 
 Это создаст задачу в Планировщике Windows (`GoszakupBot`), которая будет
 запускать бота при каждой загрузке Windows.
+Задача должна работать под учётной записью Windows с настроенным доступом к
+GitHub. Ярлык и задача используют `run-bot.bat` с тем же порядком обновления.
 Для автозаполнения окна TumarCSP нужен открытый интерактивный сеанс Windows,
 в котором работает TumarCSP. Для такой подачи используй `start-bot.bat` из
 этого сеанса.
@@ -123,12 +142,16 @@ schtasks /Delete /TN "GoszakupBot" /F   # удалить
 
 ### Альтернатива — NSSM (бот как настоящая Windows-служба)
 
+В свойствах службы укажи учётную запись Windows с доступом к репозиторию
+на вкладке **Вход в систему**.
+
 ```powershell
 winget install nssm.nssm
 nssm install GoszakupBot "C:\goszakup-bot\.venv\Scripts\python.exe" `
-    "-m" "goszakup.bot.main"
+    "-m" "goszakup.bot.windows_run"
 nssm set GoszakupBot AppDirectory "C:\goszakup-bot"
 nssm set GoszakupBot Start SERVICE_AUTO_START
+nssm set GoszakupBot AppStopMethodConsole 60000
 nssm set GoszakupBot AppStdout "C:\goszakup-bot\logs\bot.log"
 nssm set GoszakupBot AppStderr "C:\goszakup-bot\logs\bot.err.log"
 nssm start GoszakupBot
@@ -146,8 +169,10 @@ nssm remove GoszakupBot confirm   # удалить службу
 
 ## 5. Обновление бота
 
-1. `git pull --rebase --autostash` — забирает свежий код
-2. `.\.venv\Scripts\python.exe -m pip install -r requirements.txt` — обновляет зависимости
+При обычном запуске скрипт сам забирает изменения из `origin/main`.
+Если поменялся `requirements.txt`, останови бота, запусти ярлык
+«Тендер-бот — обновить» и затем снова запусти бота. Ярлык сначала обновляет
+код, затем устанавливает зависимости.
 
 После апдейта **перезапусти бот**:
 
@@ -157,6 +182,27 @@ nssm remove GoszakupBot confirm   # удалить службу
 - Если через NSSM — `nssm restart GoszakupBot`
 
 ## 6. Что делать если упало
+
+### Симптом «git не распознано»
+
+Для первого ручного обновления выполни эти команды PowerShell из папки проекта.
+
+```powershell
+$gitExe = "$env:ProgramFiles\Git\cmd\git.exe"
+& $gitExe --version
+& $gitExe pull --ff-only origin main
+```
+
+Если файла по этому пути нет, найди папку установки Git в реестре
+
+```powershell
+Get-ItemProperty 'HKLM:\SOFTWARE\GitForWindows','HKCU:\SOFTWARE\GitForWindows' -Name InstallPath -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty InstallPath
+```
+
+Подставь этот путь с суффиксом `\cmd\git.exe` в `$gitExe`.
+Для проверки установки можно выполнить `winget list --id Git.Git --exact`.
+Скрипт запуска сам ищет Git в `PATH`, реестре и стандартных папках установки.
 
 ### Симптом: бот не отвечает в Telegram
 
@@ -214,10 +260,23 @@ Select-String -Path (Join-Path $logDir 'runtime.log*') -Pattern 'telegram.pollin
 Get-Content (Join-Path $logDir 'runtime.log') -Tail 50 -Wait
 ```
 
-Для разбора времени подачи нужен отдельный файл
-`timing_<номер_тендера>_<время>.txt`. После попытки через `/bid` бот присылает
-отчёт в Telegram. Его можно получить повторно командой `/timing` или найти
-в подпапке `timing` каталога журналов.
+При запуске через Windows-ярлык бот присылает личному получателю файл о старте,
+а после штатной остановки — файл с итоговым временем работы. Локальная копия
+хранится в `runs/`. Отчёт включает до 3000 записей журнала текущего запуска.
+В GitHub в `reports/windows/run_*.txt` сохраняются замеры на старте, после
+попыток подачи, каждые 15 минут работы и при штатной остановке.
+
+После каждой попытки подачи бот сохраняет отдельный `timing_*.txt` в
+`timing/` и отправляет его личному получателю. Последний файл доступен
+командой `/timing`. В нём указано имя соответствующего файла
+`reports/windows/bid_*.txt` в ветке `origin/main`. В GitHub попадают
+длительности этапов, запросы, коды ответа и типы сетевых ошибок. Номера
+тендеров, заявок, файлов и данные доступа исключаются.
+
+Windows-бот отправляет замеры фоновым `git push` после завершения заявки.
+Если отправка не удалась, файлы хранятся в `github_pending/`
+и повторно отправляются во время работы или при следующем запуске. Причина
+сбоя записывается в `runtime.log` как `bot.run_report_push_failed`.
 
 Время до начала запроса публикации и длительность ответа портала показаны
 отдельно. Для проверки ускоренной загрузки техспецификаций можно добавить

@@ -187,7 +187,7 @@ class BidTrace:
             return ""
         duration = _http_elapsed(requests, origin, end)
         lines = [f"HTTP после старта подачи · {len(requests)} зап. · {duration:.2f} с без двойного счёта"]
-        polls = [event for event in requests if "/ajax_docs_next/" in event.name]
+        polls = [event for event in requests if "/ajax_docs_next/" in event.name + "/"]
         marks = {name: when for when, name in self.marks}
         if "public_start" in marks and "public_done" not in marks:
             lines.append(f"Начало запроса публикации · {marks['public_start'] - origin:.2f} с · "
