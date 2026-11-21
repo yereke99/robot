@@ -1,0 +1,26 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.coverage
+
+# Local secrets / dev artifacts — never bake into image
+config.yaml
+*.har
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.pem
+*.key
+.goszakup/
+
+# Editor / OS
+.DS_Store
+.idea
+.vscode
+*.swp
+
+# NB: goszakup/jars/ is NOT excluded — Kalkan needs those JARs in the image.

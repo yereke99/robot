@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "live: requires running NCALayer + real ECP key (gated by RUN_LIVE_TESTS=1)",
+]

@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s -o /dev/null -w \"no-session POST sendkey: %{http_code}\\\\n\" -X POST \"https://v3bl.goszakup.gov.kz/ru/user/sendkey/kz\" -H \"X-Requested-With: XMLHttpRequest\" -H \"Referer: https://v3bl.goszakup.gov.kz/ru/user/login\" -H \"User-Agent: Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\)\" --max-time 30)",
+      "Bash(curl -s -D - -o /dev/null \"https://v3bl.goszakup.gov.kz/ru/user/login\" -H \"User-Agent: Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\)\" --max-time 30)",
+      "Bash(python -m py_compile goszakup/client.py)",
+      "Bash(python -m pytest tests/ -x -q)",
+      "Read(//c/Users/TRXPC/Desktop/atagos-master/.venv/Scripts/**)",
+      "Read(//c/Users/TRXPC/Desktop/atagos-master/**)",
+      "Bash(\"C:/Users/TRXPC/Desktop/atagos-master/.venv/Scripts/python.exe\" -m pytest tests/ -q)",
+      "Bash(\"C:/Users/TRXPC/Desktop/atagos-master/.venv/Scripts/python.exe\" -m pytest tests/test_doc_save.py::test_parallel_sessions_uses_prewarmed_pool -q)",
+      "Bash(git stash *)",
+      "Bash(\"C:/Users/TRXPC/Desktop/atagos-master/.venv/Scripts/python.exe\" -m pytest tests/test_doc_save.py tests/test_lot_subdoc.py -q)",
+      "Bash(\"C:/Users/TRXPC/Desktop/atagos-master/.venv/Scripts/python.exe\" \"C:/Users/TRXPC/AppData/Local/Temp/claude/C--Users-TRXPC-Desktop-atagos-master--claude-worktrees-elated-rubin-6541c9/94bad931-0498-49fd-b70f-d014a631a5a7/scratchpad/test_sendkey.py\")"
+    ]
+  }
+}

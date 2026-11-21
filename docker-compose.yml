@@ -1,0 +1,21 @@
+services:
+  bot:
+    build: .
+    container_name: goszakup-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Almaty
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./secrets/ecp.p12:/secrets/ecp.p12:ro
+      - bot-data:/data
+    # Bot does not expose any inbound port — pulls updates from Telegram.
+    networks:
+      - bot-net
+
+volumes:
+  bot-data:
+
+networks:
+  bot-net:

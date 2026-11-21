@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C \"C:/Users/TRXPC/Desktop/atagos-master\" log --format=\"%an <%ae>\")",
+      "Bash(git -C \"C:/Users/TRXPC/Desktop/atagos-master\" config --list)",
+      "Bash(powershell -NoProfile -Command 'Get-CimInstance Win32_Process -Filter \"Name='\\\\''python.exe'\\\\''\" | Where-Object { $_.CommandLine -like '\\\\''*goszakup.bot.main*'\\\\'' } | Select-Object ProcessId,CommandLine | Format-List; Write-Output '\\\\''--- java \\(kalkan\\) ---'\\\\''; Get-CimInstance Win32_Process -Filter \"Name='\\\\''java.exe'\\\\''\" | Where-Object { $_.CommandLine -like '\\\\''*alkan*'\\\\'' } | Select-Object ProcessId | Format-List')",
+      "Bash(powershell -NoProfile -Command 'Stop-Process -Id 21176 -Force; Start-Sleep -Milliseconds 500; Get-CimInstance Win32_Process -Filter \"Name='\\\\''python.exe'\\\\''\" | Where-Object { $_.CommandLine -like '\\\\''*goszakup.bot.main*'\\\\'' } | Select-Object ProcessId,CommandLine | Format-List')",
+      "Bash(powershell -NoProfile -Command '$p = Get-CimInstance Win32_Process -Filter \"Name='\\\\''python.exe'\\\\''\" | Where-Object { $_.CommandLine -like '\\\\''*goszakup.bot.main*'\\\\'' }; if \\($p\\) { $p | Select-Object ProcessId,CommandLine | Format-List } else { Write-Output '\\\\''NO bot.main instances running'\\\\'' }')",
+      "Bash(./.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('goszakup/flow.py',encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('goszakup/local_signer.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(break)",
+      "Bash(powershell -NoProfile -Command 'Get-CimInstance Win32_Process -Filter \"Name='\\\\''python.exe'\\\\''\" | Where-Object { $_.CommandLine -like '\\\\''*goszakup.bot.main*'\\\\'' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; Start-Sleep -Milliseconds 400')",
+      "Bash(./.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('goszakup/flow.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(awk 'NR>=38 && NR<=60' C:/Users/TRXPC/AppData/Local/Temp/claude/C--Users-TRXPC-Desktop-atagos-master--claude-worktrees-elegant-raman-88858f/327115f3-82ec-48ff-b2d0-5fda9502351a/tasks/biem45nd4.output)",
+      "Bash(./.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('goszakup/bot/handlers/scheduled.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(ls -lat ~/.atagos/logs/ 2>/dev/null | head -20; echo \"---\"; ls -lat \"$HOME/.atagos/logs\" 2>/dev/null | head -20)",
+      "Bash(powershell -NoProfile -Command 'Get-CimInstance Win32_Process -Filter \"Name='\\\\''python.exe'\\\\''\" | Where-Object { $_.CommandLine -like '\\\\''*goszakup.bot.main*'\\\\'' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; Start-Sleep -Milliseconds 400; Write-Output '\\\\''bot killed'\\\\''')",
+      "Bash(./.venv/Scripts/python scripts/diag_download.py)",
+      "Bash(grep -vE \"^\\\\s*$\")",
+      "Bash(./.venv/Scripts/python scripts/diag_download2.py)",
+      "Bash(./.venv/Scripts/python -c ' *)",
+      "Bash(awk 'NR>=138 && NR<=185' C:/Users/TRXPC/AppData/Local/Temp/claude/C--Users-TRXPC-Desktop-atagos-master--claude-worktrees-elegant-raman-88858f/327115f3-82ec-48ff-b2d0-5fda9502351a/tasks/bdwknprr2.output)",
+      "Bash(rm -f scripts/diag_download.py scripts/diag_download2.py)",
+      "Bash(./.venv/Scripts/python -c \"import ast; ast.parse\\(open\\('goszakup/local_signer.py',encoding='utf-8'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(powershell -NoProfile -Command ' *)",
+      "Bash(powershell -NoProfile -Command 'Get-CimInstance Win32_Process -Filter \"Name='\\\\''python.exe'\\\\''\" | Where-Object { $_.CommandLine -like '\\\\''*goszakup.bot.main*'\\\\'' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; Start-Sleep -Milliseconds 500; Write-Output '\\\\''old bot killed'\\\\''')",
+      "Bash(powershell -NoProfile -Command \"\\(Test-NetConnection 127.0.0.1 -Port 6127 -WarningAction SilentlyContinue\\).TcpTestSucceeded\")",
+      "Bash(powershell -NoProfile -Command 'Get-CimInstance Win32_Process -Filter \"Name='\\\\''python.exe'\\\\''\" | Where-Object { $_.CommandLine -like '\\\\''*goszakup.bot.main*'\\\\'' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; Start-Sleep -Milliseconds 500; Write-Output '\\\\''bot killed'\\\\''')",
+      "Bash(powershell -NoProfile -Command 'Get-CimInstance Win32_Process -Filter \"Name='\\\\''python.exe'\\\\''\" | Where-Object { $_.CommandLine -like '\\\\''*goszakup.bot.main*'\\\\'' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; Start-Sleep -Milliseconds 400; Write-Output '\\\\''bot stopped'\\\\''')",
+      "Bash(awk '/T0! Подаю|Подаю заявку|docs_signed|docs_next|gamma|tumar|priceoffer|encr|EncryptOffer|price_next|poll.tick.*attempt=1 /' C:/Users/TRXPC/AppData/Local/Temp/claude/C--Users-TRXPC-Desktop-atagos-master--claude-worktrees-elegant-raman-88858f/327115f3-82ec-48ff-b2d0-5fda9502351a/tasks/b3i2g0266.output)",
+      "Read(//c/Program Files \\\\\\(x86\\\\\\)/GammaTech/TumarCSP/lib/**)",
+      "Bash(timeout 6 ./CryptoSocket.exe)",
+      "Bash(echo \"=== exit: $? ===\")",
+      "Bash(powershell -NoProfile -Command 'Get-WinEvent -FilterHashtable @{LogName='\\\\''Application'\\\\''; StartTime=\\(Get-Date\\).AddMinutes\\(-10\\)} -ErrorAction SilentlyContinue | Where-Object { $_.Message -match '\\\\''Crypto|Tumar|6127'\\\\'' } | Select-Object -First 5 TimeCreated,Id,LevelDisplayName,Message | Format-List')",
+      "Bash(powershell -NoProfile -Command '$p='\\\\''C:\\\\Users\\\\TRXPC\\\\AppData\\\\Local\\\\Temp\\\\tumsocket.log.txt'\\\\''; if \\(Test-Path $p\\) { Get-Content $p -Tail 25 } else { Write-Output '\\\\''log not found'\\\\'' }')",
+      "Bash(powershell -NoProfile -Command 'Get-CimInstance Win32_Process -Filter \"Name='\\\\''python.exe'\\\\''\" | Where-Object { $_.CommandLine -like '\\\\''*goszakup.bot.main*'\\\\'' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; Start-Sleep -Milliseconds 600; $b = Get-CimInstance Win32_Process -Filter \"Name='\\\\''python.exe'\\\\''\" | Where-Object { $_.CommandLine -like '\\\\''*goszakup.bot.main*'\\\\'' }; if \\($b\\) { Write-Output '\\\\''STILL RUNNING'\\\\''; $b|Select ProcessId|Format-List } else { Write-Output '\\\\''all bot instances killed'\\\\'' }')",
+      "Bash(./.venv/Scripts/python -)",
+      "Bash(PYTHONIOENCODING=utf-8 ./.venv/Scripts/python -)",
+      "Bash(powershell -NoProfile -Command 'Get-CimInstance Win32_Process -Filter \"Name='\\\\''python.exe'\\\\''\" | Where-Object { $_.CommandLine -like '\\\\''*goszakup.bot.main*'\\\\'' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; Start-Sleep -Milliseconds 500')"
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+# Secrets & personal material — NEVER commit
+*.p12
+*.har
+config.yaml
+.env
+secrets/
+*.secret
+~/.atagos/
+
+# Reference docs dropped into the repo root
+*.pdf
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Local state / logs
+state/
+logs/
+*.log
+
+# OS
+.DS_Store
