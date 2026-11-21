@@ -32,7 +32,7 @@ GUARANTEE_TYPES = {
 SETTABLE: dict[str, tuple[str, str]] = {
     "guarantee_type": ("int", "Тип обеспечения заявки (typeDoc; 3 = денежный взнос с кошелька)"),
     "confirm_before_submit": ("bool", "Спрашивать подтверждение в Telegram перед подачей"),
-    "dumping_floor_ratio": ("float", "Доля от плановой цены = минимальная ставка (напр. 0.80)"),
+    "dumping_floor_ratio": ("float", "Доля для расчёта минимума, если портал его не передал (например 0.80)"),
     "dry_run": ("bool", "Тестовый режим: собрать заявку, но НЕ подавать"),
 }
 

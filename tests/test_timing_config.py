@@ -331,6 +331,7 @@ async def test_bid_progress_does_not_delay_portal_or_hold_the_bid_lock(monkeypat
     ctx = SimpleNamespace(
         bid_lock=asyncio.Lock(), current_bid=None, queue_waiters=0,
         bid_settings={"dry_run": False},
+        config=SimpleNamespace(raw={"defaults": {"pipeline_type": "repairs"}}),
     )
 
     async def send_message(**kwargs):
@@ -342,6 +343,7 @@ async def test_bid_progress_does_not_delay_portal_or_hold_the_bid_lock(monkeypat
     async def edit_message_text(**kwargs):
         assert not ctx.bid_lock.locked()
         assert "Заявка успешно подана" in kwargs["text"]
+        assert "Цена за единицу: 80% от плановой" in kwargs["text"]
         assert "Запросы и задержки" in kwargs["text"]
         assert "ajax_public_application" in kwargs["text"]
 

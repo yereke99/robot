@@ -33,6 +33,7 @@ import time
 from contextlib import AsyncExitStack, aclosing
 from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, Decimal
+from math import isfinite
 from typing import Awaitable, Callable, Optional, Sequence
 
 import httpx
@@ -47,6 +48,8 @@ from .timing import trace_event, trace_mark
 from .tumar import EncrInfo, TumarCSP
 
 log = structlog.get_logger("flow")
+
+REPAIRS_PLANNED_PRICE_RATIO = 0.80
 
 
 # ---- document plan (per tender type; defaults match announce 17049098) ----
@@ -298,9 +301,8 @@ class BeneficiaryInfo:
 class AtagosBidParams:
     announce_id: str
     tender_lot_ids: list[int]
-    # Bid price. If None, we bid the dumping floor — the exact minimum (the
-    # operator's hard rule). Floor = server's d_sum if it returns one, else
-    # ceil(pl_sum * dumping_floor_ratio, 2 decimals). See _parse_encr_info.
+    # An explicit offer takes precedence. Otherwise use planned_price_ratio
+    # when enabled, or the portal floor with the local ratio as a fallback.
     price: Optional[float] = None
     dumping_floor_ratio: float = 0.80
     dry_run: bool = False
@@ -371,6 +373,7 @@ class AtagosBidParams:
     # the docs_next self-heal re-saves it WITH barriers — a wrong guess costs
     # seconds, not the bid.
     lot_barrier: str = "each"
+    planned_price_ratio: Optional[float] = None
 
 
 def _is_tech_spec_reject(msg: Optional[str]) -> bool:
@@ -1866,7 +1869,7 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None):
 
     # Fallback source of pl_sum if ajax_get_encr_info doesn't carry it: the
     # planned price rendered next to each .offer_gamma input on this page.
-    page_pl = _extract_planned_sums(po_html)
+    page_pl = _extract_planned_sums(po_html, allow_table_fallback=params.planned_price_ratio is None)
 
     # public_key (the per-tender EFC cert) lives in a hidden input on the price
     # page — ajax_get_encr_info doesn't return it, but EncryptOfferPrice needs it.
@@ -1904,10 +1907,11 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None):
                 raw, lp_id,
                 override_price=params.price,
                 floor_ratio=params.dumping_floor_ratio,
+                planned_price_ratio=params.planned_price_ratio,
                 page_pl_sum=page_pl.get(lp_id, 0.0),
                 page_public_key=page_public_key,
             )
-            prices_by_lp[lp_id] = info.d_sum
+            prices_by_lp[lp_id] = info.bidding_price
             enc = await tumar.encrypt_offer_price(info)
             encrypted_by_pair[(app_lot, lp_id)] = enc.encrypted_data
 
@@ -1987,7 +1991,7 @@ def dumping_floor(pl_sum: float, ratio: float = 0.80) -> float:
     return float(val.quantize(Decimal("0.01"), rounding=ROUND_CEILING))
 
 
-def _extract_planned_sums(html_text: str) -> dict[int, float]:
+def _extract_planned_sums(html_text: str, *, allow_table_fallback: bool = True) -> dict[int, float]:
     """Best-effort: map buy_lot_point_id -> planned price from the price page.
 
     The .offer_gamma inputs carry the planned amount in a data attribute
@@ -1996,15 +2000,19 @@ def _extract_planned_sums(html_text: str) -> dict[int, float]:
     out: dict[int, float] = {}
     if not html_text:
         return out
+    attribute = r"data-plan+[a-z_-]*" if allow_table_fallback else r"data-plann?ed-price"
     for m in re.finditer(
-        r'buy_lot_point_id="(\d+)"[^>]*?data-plan+[a-z_-]*="([\d.,\s\xa0]+)"'
-        r'|data-plan+[a-z_-]*="([\d.,\s\xa0]+)"[^>]*?buy_lot_point_id="(\d+)"',
+        rf'buy_lot_point_id="(\d+)"[^>]*?{attribute}="([\d.,\s\xa0]+)"'
+        rf'|{attribute}="([\d.,\s\xa0]+)"[^>]*?buy_lot_point_id="(\d+)"',
         html_text,
     ):
         if m.group(1):
             out[int(m.group(1))] = _num(m.group(2))
         else:
             out[int(m.group(4))] = _num(m.group(3))
+
+    if not allow_table_fallback:
+        return out
 
     for row in re.finditer(r'<tr[^>]*>(.*?)</tr>', html_text, re.DOTALL):
         row_html = row.group(1)
@@ -2026,6 +2034,7 @@ def _parse_encr_info(
     *,
     override_price: Optional[float],
     floor_ratio: float = 0.80,
+    planned_price_ratio: Optional[float] = None,
     page_pl_sum: float = 0.0,
     page_public_key: Optional[str] = None,
 ) -> EncrInfo:
@@ -2035,12 +2044,8 @@ def _parse_encr_info(
     (public_key, sign, salt, pl_sum, d_sum, id_priceoffer, d_messageUp/Down);
     tolerant of camelCase.
 
-    Price policy (operator's hard rule — bid the exact minimum, never above):
-      * prefer the server's ``d_sum`` (authoritative — it's the value the real
-        browser submission used);
-      * else compute ceil(pl_sum * floor_ratio, 2dp) ourselves;
-      * cross-check the two and log loudly on mismatch;
-      * an explicit override_price is honoured only if inside [floor, pl_sum].
+    Keep the portal's floor in the provider parameters and validate the offer
+    separately. A configured planned-price ratio must yield an allowed offer.
     """
     def pick(*keys, default=None):
         for k in keys:
@@ -2056,8 +2061,10 @@ def _parse_encr_info(
 
     # Real field names from a live ajax_get_encr_info: plnSum (ceiling),
     # minPrice (dumping floor), salt, sign, info ("<id>;<pl>;<min>;").
-    pl_sum = _num(pick("pl_sum", "plSum", "planned_sum", "plannedSum", "plnSum")) or page_pl_sum or info_pl
+    pl_sum = _num(pick("pl_sum", "plSum", "planned_sum", "plannedSum", "plnSum")) or info_pl or page_pl_sum
     server_d = _num(pick("d_sum", "dSum", "dumping_sum", "dumpingSum", "minPrice", "min_price")) or info_d
+    if not (isfinite(pl_sum) and isfinite(server_d)) or pl_sum < 0 or server_d < 0:
+        raise RuntimeError(f"Некорректный диапазон цены портала для позиции {lp_id}.")
     computed = dumping_floor(pl_sum, floor_ratio) if pl_sum else 0.0
 
     floor = server_d or computed
@@ -2065,10 +2072,7 @@ def _parse_encr_info(
         log.warning("flow.floor.mismatch", lp_id=lp_id, server_d=server_d,
                     computed=computed, pl_sum=pl_sum, ratio=floor_ratio)
     if not floor:
-        raise RuntimeError(
-            f"could not determine dumping floor for lp {lp_id} "
-            f"(pl_sum={pl_sum}, server_d={server_d}); ajax_get_encr_info={str(raw)[:300]}"
-        )
+        raise RuntimeError(f"Не удалось определить минимальную цену для позиции {lp_id}.")
 
     price = floor
     if override_price is not None:
@@ -2077,6 +2081,15 @@ def _parse_encr_info(
         else:
             log.warning("flow.override_out_of_range", override=override_price,
                         floor=floor, pl_sum=pl_sum, using=floor)
+    elif planned_price_ratio is not None:
+        if pl_sum <= 0:
+            raise RuntimeError(f"Портал не передал плановую цену для позиции {lp_id}.")
+        price = dumping_floor(pl_sum, planned_price_ratio)
+        if not floor <= price <= pl_sum:
+            raise RuntimeError(
+                f"Расчётная цена {price:.2f} для позиции {lp_id} вне диапазона "
+                f"портала {floor:.2f}–{pl_sum:.2f}."
+            )
     log.info("flow.price.chosen", lp_id=lp_id, pl_sum=pl_sum, server_d=server_d,
              computed_floor=computed, bidding=price)
 
@@ -2091,7 +2104,7 @@ def _parse_encr_info(
         id_priceoffer = f"_{lp_id}"
 
     # Messages: synthesize in the goszakup format if the server didn't send them
-    # (TumarCSP uses them for its range guard). minPrice is the floor we bid.
+    # TumarCSP uses them for its range guard.
     msg_up = pick("d_messageUp", "messageUp") or (
         f"Введенное значение превышает плановую сумму {pl_sum} тнг" if pl_sum else "")
     msg_down = pick("d_messageDown", "messageDown") or (
@@ -2105,10 +2118,11 @@ def _parse_encr_info(
         sign=pick("sign", "signature", default=""),
         salt=pick("salt", default=""),
         pl_sum=pl_sum,
-        d_sum=price,
+        d_sum=floor,
         id_priceoffer=str(id_priceoffer),
         info=info_str,
         public_key=pub,
         message_up=msg_up,
         message_down=msg_down,
+        offer_price=price if price != floor else None,
     )

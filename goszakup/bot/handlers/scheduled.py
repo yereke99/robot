@@ -389,7 +389,7 @@ async def _fire_one(ctx: BotContext, tender: ScheduledTender,
             params=AtagosBidParams(
                 announce_id=tender.announce_id,
                 tender_lot_ids=lot_ids,
-                price=None,
+                planned_price_ratio=flow_repairs.REPAIRS_PLANNED_PRICE_RATIO,
                 dumping_floor_ratio=cfg["floor_ratio"],
                 dry_run=cfg["dry_run"],
                 guarantee_type=cfg["guarantee_type"],

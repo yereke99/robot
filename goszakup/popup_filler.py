@@ -21,6 +21,8 @@ _PRICE_TITLES = (
     ("price", "offer"), ("price", "proposal"), ("price", "bid"), ("price", "enter"),
     ("баға", "ұсын"), ("баға", "енгіз"),
 )
+_PRICE_LABELS = {"заполнение ценового предложения", "укажите цену за единицу"}
+_PRICE_ACTION_LABELS = {"сохранить в jpeg", "отмена"}
 _PROVIDER_IMAGES = re.compile(r"(?:cryptosocket|tumarcsp)(?:[ _-]?(?:32|64))?\.exe", re.IGNORECASE)
 _OK_LABELS = {"ok", "ок", "да", "подтвердить", "принять", "растау"}
 _POLL_INTERVAL_S = 0.05
@@ -83,6 +85,7 @@ class _Dialog:
     pid: int
     field: int
     button: int
+    identifying_controls: tuple[tuple[int, str], ...] = ()
 
 
 class _Win32:
@@ -180,15 +183,17 @@ class _Win32:
         result = self._send(hwnd, _WM_GETTEXT, len(buffer), buffer, deadline)
         return buffer.value if result and result < len(buffer) - 1 else ""
 
-    def _button_label(self, hwnd: int, deadline: float) -> str:
-        return self._control_text(hwnd, deadline).replace("&", "").strip().casefold()
+    def _control_label(self, hwnd: int, deadline: float) -> str:
+        caption = self._control_text(hwnd, deadline).replace("&", "").casefold()
+        return " ".join(caption.split()).rstrip(" .:")
 
     def select_dialog(self, hwnd: int, deadline: float) -> _Dialog | None:
-        if not _price_title(self.window_text(hwnd)):
-            return None
         pid = self.pid(hwnd)
         if not pid or not self.is_provider(pid):
             return None
+        has_price_title = _price_title(self.window_text(hwnd))
+        price_label = None
+        action_buttons = []
         fields = []
         buttons = []
         for child in self.visible_windows(hwnd):
@@ -197,38 +202,65 @@ class _Win32:
             if self.pid(child) != pid:
                 continue
             kind = self._class_name(child)
+            # Some provider versions put the heading inside a borderless form.
+            if "static" in kind or "label" in kind:
+                if not has_price_title and price_label is None:
+                    label = self._control_label(child, deadline)
+                    if label in _PRICE_LABELS:
+                        price_label = (child, label)
+                continue
             style = self.user.GetWindowLongW(child, _GWL_STYLE)
             if "edit" in kind and not style & _ES_READONLY and self.user.IsWindowEnabled(child):
                 fields.append(child)
-            if (
-                "button" in kind and style & 0x0F in (0, 1, 0x0B)
-                and self._button_label(child, deadline) in _OK_LABELS
-            ):
-                buttons.append(child)
-        if len(fields) == len(buttons) == 1:
-            return _Dialog(hwnd, pid, fields[0], buttons[0])
-        return None
+            if "button" in kind and style & 0x0F in (0, 1, 0x0B):
+                label = self._control_label(child, deadline)
+                if label in _OK_LABELS:
+                    buttons.append(child)
+                elif not has_price_title and label in _PRICE_ACTION_LABELS:
+                    action_buttons.append((child, label))
+        if len(fields) != 1 or len(buttons) != 1:
+            return None
+        if has_price_title:
+            identifying_controls = ()
+        elif price_label is not None:
+            identifying_controls = (price_label,)
+        elif len(action_buttons) == 2 and {label for _, label in action_buttons} == _PRICE_ACTION_LABELS:
+            # An owner-drawn heading may have no separate native text control.
+            identifying_controls = tuple(action_buttons)
+        else:
+            return None
+        return _Dialog(hwnd, pid, fields[0], buttons[0], identifying_controls)
 
     def valid(self, dialog: _Dialog) -> bool:
+        children = (dialog.field, dialog.button, *(hwnd for hwnd, _ in dialog.identifying_controls))
         return (
             self.pid(dialog.hwnd) == dialog.pid
             and self.is_provider(dialog.pid)
-            and _price_title(self.window_text(dialog.hwnd))
+            and (dialog.identifying_controls or _price_title(self.window_text(dialog.hwnd)))
             and self.user.IsWindowVisible(dialog.hwnd)
             and self.user.IsWindowEnabled(dialog.field)
             and all(
                 self.user.IsChild(dialog.hwnd, child)
                 and self.pid(child) == dialog.pid
                 and self.user.IsWindowVisible(child)
-                for child in (dialog.field, dialog.button)
+                for child in children
             )
         )
 
-    def set_value(self, dialog: _Dialog, value: str, deadline: float) -> bool:
+    def _matches_identifying_controls(self, dialog: _Dialog, deadline: float) -> bool:
+        return all(self._control_label(hwnd, deadline) == label for hwnd, label in dialog.identifying_controls)
+
+    def set_value(self, dialog: _Dialog, value: str, deadline: float, stop) -> bool:
+        if not self._matches_identifying_controls(dialog, deadline) or not _can_act(deadline, stop):
+            return False
         return bool(self._send(dialog.field, _WM_SETTEXT, 0, ctypes.create_unicode_buffer(value), deadline))
 
     def type_value(self, dialog: _Dialog, value: str, deadline: float, stop) -> bool:
-        if not self.valid(dialog) or not _can_act(deadline, stop):
+        if (
+            not self.valid(dialog)
+            or not self._matches_identifying_controls(dialog, deadline)
+            or not _can_act(deadline, stop)
+        ):
             return False
         if self._send(dialog.field, _EM_SETSEL, 0, -1, deadline) is None:
             return False
@@ -254,8 +286,9 @@ class _Win32:
             self.pid(parent) != dialog.pid
             or not self.valid(dialog)
             or not self.ready_to_confirm(dialog)
-            or self._button_label(dialog.button, deadline) not in _OK_LABELS
+            or self._control_label(dialog.button, deadline) not in _OK_LABELS
             or not _price_matches(value, self.read_value(dialog, deadline))
+            or not self._matches_identifying_controls(dialog, deadline)
             or not _can_act(deadline, stop)
         ):
             return False
@@ -276,7 +309,7 @@ def _fill_dialog(api: _Win32, dialog: _Dialog, value: str, deadline: float, stop
             if targeted_typing:
                 wrote = api.type_value(dialog, candidate, deadline, stop)
             else:
-                wrote = api.set_value(dialog, candidate, deadline)
+                wrote = api.set_value(dialog, candidate, deadline, stop)
             if wrote and _price_matches(value, api.read_value(dialog, deadline)):
                 # A setter can display the right value without triggering the
                 # provider's keyboard-driven validation. Give it a moment to
@@ -333,8 +366,10 @@ def fill_price_popup(
                 if dialog is not None:
                     candidates.append(dialog)
         if len(candidates) == 1:
-            if _fill_dialog(api, candidates[0], value, deadline, stop):
-                log.info("popup.win32.filled")
+            dialog = candidates[0]
+            if _fill_dialog(api, dialog, value, deadline, stop):
+                matched_by = ("title", "label", "buttons")[len(dialog.identifying_controls)]
+                log.info("popup.win32.filled", matched_by=matched_by)
                 return True
             return False
         if len(candidates) > 1:

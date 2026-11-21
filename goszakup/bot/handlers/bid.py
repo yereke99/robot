@@ -755,8 +755,7 @@ async def _run_pipeline(
             flow_params = AtagosBidParams(
                 announce_id=announce_id,
                 tender_lot_ids=lot_ids,
-                # price=None → flow.py автоматически ставит dumping floor (80% от plnSum)
-                price=None,
+                planned_price_ratio=flow_repairs.REPAIRS_PLANNED_PRICE_RATIO,
                 dumping_floor_ratio=floor_ratio,
                 dry_run=dry_run,
                 signer=ctx.signer,
@@ -986,18 +985,22 @@ async def _do_submit(
         context.user_data.clear()
         return ConversationHandler.END
 
+    price_text = (
+        f"Цена за единицу: {flow_repairs.REPAIRS_PLANNED_PRICE_RATIO:.0%} от плановой\n"
+        if ctx.config.raw.get("defaults", {}).get("pipeline_type") == "repairs" else ""
+    )
     if err == "dry_run_complete":
         await pm.finish(
             f"✅ <b>Dry-run OK</b> — собрана и подписана, <b>НЕ подана</b>\n"
             f"app <code>{app_id}</code>\n"
-            f"Цена = минимум (демпинг −20%)\n"
+            f"{price_text}"
             f"{elapsed_str}"
         )
     else:
         await pm.finish(
             f"✅ <b>Заявка успешно подана!</b>\n"
             f"app <code>{app_id}</code>\n"
-            f"Цена = минимум (демпинг −20%)\n"
+            f"{price_text}"
             f"{elapsed_str}"
         )
     await context.bot.send_message(

@@ -47,7 +47,7 @@ tumarcsp:
   # обновляется при истечении срока.
   api_key: "PASTE_TUMARCSP_API_KEY_HERE"
   # На Windows бот вводит и проверяет цену в окне TumarCSP автоматически.
-  # Сумма берётся из минимума, который портал вернул для конкретного лота.
+  # Telegram-бот для работ вводит 80% плановой цены и проверяет диапазон портала.
   autofill_popup: true
 
 ncalayer:
@@ -71,7 +71,7 @@ defaults:
   http_timeout_s: 10
   log_dir: "~/.atagos/logs"
   state_dir: "~/.atagos/state"
-  dumping_floor_ratio: 0.80         # d_sum = pl_sum * 0.80 (минимум, который и подаём)
+  dumping_floor_ratio: 0.80         # Расчёт минимума, если портал его не передал
   # Как часто слать «тендер ещё на ожидании» в телеграм, пока ждём открытия.
   waiting_notify_interval_s: 60
   # Как сохранять подписи документов:

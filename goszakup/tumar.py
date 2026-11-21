@@ -116,7 +116,7 @@ class EncrInfo:
 
     Field names mirror the EncryptOfferPrice ``Param`` keys so the page→provider
     hand-off stays one-to-one. ``ajax_get_encr_info`` returns these; we forward
-    them. ``pl_sum`` is the ceiling, ``d_sum`` is the dumping floor we bid.
+    them. ``pl_sum`` and ``d_sum`` are the portal's price bounds.
     """
 
     sign: str
@@ -131,6 +131,11 @@ class EncrInfo:
     public_key: Optional[str] = None
     message_up: str = ""
     message_down: str = ""
+    offer_price: Optional[float] = None
+
+    @property
+    def bidding_price(self) -> float:
+        return self.d_sum if self.offer_price is None else self.offer_price
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -341,12 +346,7 @@ class TumarCSP:
                         await asyncio.wait_for(ws.close(), timeout=1.0)
 
     async def encrypt_offer_price(self, info: EncrInfo) -> EncryptResult:
-        """Seal one lot-point price. ``info`` comes straight from ajax_get_encr_info.
-
-        We bid ``info.d_sum`` — the dumping floor, i.e. the minimum allowed
-        price. (Anything above it loses the tender, per the operator's hard
-        rule; see EncryptOfferPrice's d_messageDown / d_messageUp guards.)
-        """
+        """Seal one lot-point price within the provider's supplied bounds."""
         param: dict = {
             "pl_sum": info.pl_sum,
             "d_sum": info.d_sum,
@@ -372,13 +372,13 @@ class TumarCSP:
         # Hold the global popup gate across send -> fill -> recv: the popup is on
         # screen for this whole window, so no other tender may drive its own
         # popup meanwhile (and the next one waits out the spacing). Each gate
-        # acquisition types exactly THIS offer's d_sum.
+        # acquisition types exactly this offer's price.
         async with _popup_gate(label=info.id_priceoffer):
             ws = self._ws
             if ws is None:
                 raise TumarError("Соединение с TumarCSP закрыто. Запусти новую попытку.")
             if getattr(self._autofill, "requires_confirmation", False):
-                resp = await self._request_price_automatically(ws, payload, info.d_sum)
+                resp = await self._request_price_automatically(ws, payload, info.bidding_price)
             else:
                 resp = await self._request_price_interactively(ws, payload, info)
         log.info(
@@ -386,6 +386,7 @@ class TumarCSP:
             id_priceoffer=info.id_priceoffer,
             d_sum=info.d_sum,
             pl_sum=info.pl_sum,
+            price=info.bidding_price,
             code=resp.get("code"),
         )
         return EncryptResult(
@@ -406,12 +407,13 @@ class TumarCSP:
         t_popup_mono = time.monotonic()
         try:
             if self._autofill is not None:
-                log.info("tumar.encrypt.autofill.start", price=info.d_sum,
+                price = info.bidding_price
+                log.info("tumar.encrypt.autofill.start", price=price,
                          id_priceoffer=info.id_priceoffer)
                 if getattr(self._autofill, "supports_stop", False):
-                    fill_call = asyncio.to_thread(self._autofill, info.d_sum, fill_stop)
+                    fill_call = asyncio.to_thread(self._autofill, price, fill_stop)
                 else:
-                    fill_call = asyncio.to_thread(self._autofill, info.d_sum)
+                    fill_call = asyncio.to_thread(self._autofill, price)
                 fill_task = asyncio.ensure_future(fill_call)
                 await asyncio.sleep(0.05)
             else:

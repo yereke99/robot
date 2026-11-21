@@ -45,8 +45,9 @@ ajax_public_application(...)              <- gated by dry_run
 
 **We do NOT reimplement EncryptOfferPrice** — it's proprietary. We drive the real
 TumarCSP. ⇒ **TumarCSP must be installed & running on the bot host.** `d_sum` is
-the dumping floor (= `pl_sum × 0.8`) — the exact minimum we always bid (operator's
-hard rule: any higher price loses the tender 100%).
+the portal's lower price bound. Telegram `/bid` and `/schedule` for repairs enter
+80% of the planned unit price, rounded up to cents, when the result fits the
+portal's range.
 
 Signing (login XML, all docs, the gamma CMS) stays on the **Kalkan Java helper**
 (`local_signer.py` + `jars/`) — no NCALayer needed.

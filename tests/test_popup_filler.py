@@ -27,7 +27,7 @@ class FakeClock:
 class FakeWindows(popup._Win32):
     def __init__(self):
         self.windows = {}
-        self.owner_images = {1: "TumarCSP.exe", 2: "Browser.exe"}
+        self.owner_images = {1: "TumarCSP.exe", 2: "Browser.exe", 3: "CryptoSocket.exe"}
         self.actions = []
         self.readback = None
         self.set_response = lambda value: value
@@ -42,7 +42,7 @@ class FakeWindows(popup._Win32):
             PostMessageW=self.post,
         )
 
-    def add_dialog(self, hwnd, *, pid=1, title="Заполнение ценового предложения"):
+    def add_dialog(self, hwnd, *, pid=1, title="Заполнение ценового предложения", price_label=None):
         self.windows[hwnd] = SimpleNamespace(
             title=title, parent=None, pid=pid, enabled=True,
         )
@@ -50,9 +50,16 @@ class FakeWindows(popup._Win32):
             parent=hwnd, pid=pid, enabled=True, style=0, kind="edit",
             text="", control_id=2,
         )
-        self.windows[hwnd + 2] = SimpleNamespace(
-            parent=hwnd, pid=pid, enabled=True, style=1, kind="button",
-            text="&ОК", control_id=3,
+        self.add_button(hwnd + 2, hwnd, "&ОК")
+        if price_label is not None:
+            self.windows[hwnd + 3] = SimpleNamespace(
+                parent=hwnd, pid=pid, kind="windowsforms10.static.app.0.123", text=price_label,
+            )
+
+    def add_button(self, hwnd, parent, text, *, style=1):
+        self.windows[hwnd] = SimpleNamespace(
+            parent=parent, pid=self.windows[parent].pid, enabled=True, style=style, kind="button",
+            text=text, control_id=3,
         )
 
     def visible_windows(self, parent=None):
@@ -129,6 +136,70 @@ def test_fills_only_the_new_verified_provider_window(desktop, readback):
         ("write", 41, "80.00"),
         ("confirm", 40, popup._WM_COMMAND, 42),
     ]
+
+
+@pytest.mark.parametrize(("title", "label"), [
+    ("", "Заполнение ценового предложения."),
+    ("CryptoSocket", "Укажите цену\r\nза единицу:"),
+])
+def test_fills_a_new_borderless_provider_dialog_by_its_visible_label(desktop, title, label):
+    api, clock = desktop
+    api.add_dialog(10, title=title, pid=3, price_label=label)
+
+    def open_new_windows():
+        api.add_dialog(20, title=title, pid=2, price_label=label)
+        api.add_dialog(30, title=title, pid=3, price_label="Настройки цены")
+        api.add_dialog(40, title=title, pid=3, price_label=label)
+
+    assert popup.fill_price_popup(80.0, stop=clock, ready=open_new_windows)
+    assert api.actions == [
+        ("write", 41, "80.00"),
+        ("confirm", 40, popup._WM_COMMAND, 42),
+    ]
+
+
+def test_borderless_dialog_never_confirms_if_its_label_changes(desktop):
+    api, clock = desktop
+    api.on_value_read = lambda: setattr(api.windows[13], "text", "Сохранение настроек.")
+
+    assert not popup.fill_price_popup(
+        80.0, stop=clock, ready=lambda: api.add_dialog(10, title="", price_label="Укажите цену за единицу"),
+    )
+    assert api.actions == [("write", 11, "80.00")]
+
+
+@pytest.mark.parametrize(("labels", "matched"), [
+    (("Сохранить в JPEG", "Отмена"), True),
+    (("Сохранить в JPEG",), False),
+    (("Отмена",), False),
+    (("Сохранить в JPEG", "Отмена", "Отмена"), False),
+])
+def test_borderless_dialog_requires_the_exact_pair_of_additional_buttons(desktop, labels, matched):
+    api, clock = desktop
+
+    def open_dialog():
+        api.add_dialog(10, title="CryptoSocket", pid=3)
+        for hwnd, label in enumerate(labels, 13):
+            api.add_button(hwnd, 10, label, style=0x0B)
+
+    assert popup.fill_price_popup(80.0, timeout_s=0.2, stop=clock, ready=open_dialog) is matched
+    assert api.actions == ([
+        ("write", 11, "80.00"),
+        ("confirm", 10, popup._WM_COMMAND, 12),
+    ] if matched else [])
+
+
+def test_borderless_dialog_never_confirms_if_an_identifying_button_changes(desktop):
+    api, clock = desktop
+    api.on_value_read = lambda: setattr(api.windows[13], "text", "Сохранить")
+
+    def open_dialog():
+        api.add_dialog(10, title="", pid=3)
+        api.add_button(13, 10, "Сохранить в JPEG")
+        api.add_button(14, 10, "Отмена")
+
+    assert not popup.fill_price_popup(80.0, stop=clock, ready=open_dialog)
+    assert api.actions == [("write", 11, "80.00")]
 
 
 @pytest.mark.parametrize("readback", ["180.00", "80.01", "80.00 KZT", ""])

@@ -9,7 +9,7 @@ import threading
 import pytest
 from websockets.protocol import State
 
-from goszakup import tumar
+from goszakup import flow, tumar
 
 
 class _Socket:
@@ -121,6 +121,62 @@ async def test_auto_requires_verified_input_even_after_provider_reply():
     assert socket.sent[0]["Param"]["d_sum"] == 80.01
     assert results == [tumar.EncryptResult("sealed", "key", "", "")]
     assert not socket.closed
+
+
+async def test_repairs_autofill_discounts_plan_without_changing_provider_floor():
+    socket = _Socket(reply_immediately=True)
+    entered = []
+
+    def fill(price, stop, *, ready):
+        ready()
+        assert socket.recv_started.wait(1.0)
+        entered.append(price)
+        return True
+
+    info = flow._parse_encr_info(
+        {"plnSum": "2038731.00", "minPrice": "1.00", "sign": "portal-signature", "salt": "salt"},
+        2,
+        override_price=None,
+        planned_price_ratio=flow.REPAIRS_PLANNED_PRICE_RATIO,
+    )
+    provider = _provider(fill, socket)
+    await asyncio.wait_for(provider.encrypt_offer_price(info), timeout=2.0)
+
+    assert entered == [1630984.80]
+    assert info.bidding_price == 1630984.80
+    assert socket.sent[0]["Param"]["pl_sum"] == 2038731.00
+    assert socket.sent[0]["Param"]["d_sum"] == 1.00
+    assert socket.sent[0]["Param"]["sign"] == "portal-signature"
+
+
+def test_repairs_rejects_discount_when_portal_floor_is_higher():
+    with pytest.raises(RuntimeError, match="80.00.*81.00–100.00"):
+        flow._parse_encr_info(
+            {"plnSum": "100.00", "minPrice": "81.00"},
+            2,
+            override_price=None,
+            planned_price_ratio=flow.REPAIRS_PLANNED_PRICE_RATIO,
+        )
+
+
+def test_repairs_plan_fallback_uses_only_explicit_price_fields():
+    price_page = (
+        '<tr><td>999</td><td><input buy_lot_point_id="1" data-planned-quantity="10"></td></tr>'
+        '<tr><td>999</td><td><input buy_lot_point_id="2" data-planed-price="150.50"></td></tr>'
+    )
+
+    assert flow._extract_planned_sums(price_page, allow_table_fallback=False) == {2: 150.50}
+
+
+def test_legacy_explicit_offer_keeps_the_same_price_and_portal_floor():
+    info = flow._parse_encr_info(
+        {"plnSum": "100.09", "minPrice": "80.08"},
+        2,
+        override_price=92.0,
+    )
+
+    assert info.bidding_price == 92.0
+    assert info.d_sum == 80.08
 
 
 @pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancel"])
