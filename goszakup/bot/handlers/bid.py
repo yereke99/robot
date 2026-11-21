@@ -785,7 +785,7 @@ async def _run_pipeline(
                 tumar_ws_url=raw_tumarcsp.get("ws_url", "wss://127.0.0.1:6127/tumarcsp/"),
                 autofill_price_popup=raw_tumarcsp.get("autofill_popup", False),
                 popup_coords=raw_tumarcsp.get("popup"),
-                lot_barrier=str(defaults.get("lot_barrier", "each")),
+                **flow_repairs.speed_options(defaults),
             )
             # Account-scoped session clones (not tender-scoped).
             fresh_pool = ctx.get_doc_pool_if_fresh(announce_id)

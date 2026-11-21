@@ -53,7 +53,7 @@ from telegram.ext import (
 
 from .. import secrets as gz_secrets
 from ..client import GoszakupClient, SessionExpired
-from ..flow import AtagosBidParams, BeneficiaryInfo, submit_bid
+from ..flow import AtagosBidParams, BeneficiaryInfo, speed_options, submit_bid
 from ..local_signer import KalkanSigner
 from ..state import StateStore
 from ..tumar import TumarCSP
@@ -224,6 +224,7 @@ class TenderManager:
                 # "serial" (safe, default) | "parallel_sessions" (experimental B —
                 # each doc saved on its own login). Roll back by flipping to serial.
                 doc_save_mode=cfg["defaults"].get("doc_save_mode", "serial"),
+                **speed_options(cfg["defaults"]),
             )
             state = await submit_bid(
                 params=params,

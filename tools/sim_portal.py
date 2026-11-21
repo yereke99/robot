@@ -85,6 +85,18 @@ class Portal:
         self.deposit_add_disconnect = cfg.get("deposit_add_disconnect")
         self.deposit_add_attempted = False
         self.lock = asyncio.Lock() if cfg.get("session_lock") else None
+        # Portal behaviours the bot's speed switches depend on (unknown live):
+        #   early_show_doc      тех.спец parent GET while lots_next is in flight:
+        #                       "redirect" (stage-gated, default) | "serve"
+        #   ts_overlap          overlapping тех.спец page saves / no barrier between:
+        #                       "violation" (default) | "accept" | "clobber"
+        #                       (clobber: the later commit wipes the earlier page)
+        #   signs_before_encrypt  save_gamma_signs before add_encrypt committed:
+        #                       "violation" (default) | "accept" | "reject"
+        self.early_show_doc = cfg.get("early_show_doc", "redirect")
+        self.ts_overlap = cfg.get("ts_overlap", "violation")
+        self.signs_before_encrypt = cfg.get("signs_before_encrypt", "violation")
+        self.signs_posts = 0
 
         self.lot_ids = [41000001 + i for i in range(self.lots)]
         self.app_lots = {lid: 85000001 + i for i, lid in enumerate(self.lot_ids)}
@@ -343,6 +355,11 @@ class Portal:
 
             def build():
                 if self.stage != "docs":
+                    if self.stage == "lots" and doc == 3334 and self.lots_added:
+                        # A read only — what matters is that nothing is WRITTEN early.
+                        if self.early_show_doc == "serve":
+                            return httpx.Response(200, html=self.doc_page(doc))
+                        return self.redirect_to_stage()
                     if self.stage == "lots":
                         self.bad(f"show_doc/{doc} GET before lots_next committed")
                     return self.redirect_to_stage()
@@ -463,10 +480,12 @@ class Portal:
                 sigs = sorted(int(k[len("signature["):-1]) for k in form if k.startswith("signature["))
                 if sigs != sorted(self.ts_fids(app_lot, num)):
                     self.bad(f"тех.спец save {app_lot}/{num}: signatures for {sigs}")
-                if self.ts_inflight:
-                    self.bad("two тех.спец page saves OVERLAP")
-                if not self.parent_get_since_last_ts_save:
-                    self.bad("тех.спец page saved without the GET barrier after the previous page")
+                overlapped = self.ts_inflight > 0
+                if self.ts_overlap == "violation":
+                    if overlapped:
+                        self.bad("two тех.спец page saves OVERLAP")
+                    if not self.parent_get_since_last_ts_save:
+                        self.bad("тех.спец page saved without the GET barrier after the previous page")
                 self.ts_inflight += 1
 
                 n_try = self.ts_attempts.get((app_lot, num), 0) + 1
@@ -477,6 +496,10 @@ class Portal:
                     self.parent_get_since_last_ts_save = False
                     if num in self.drop_ts_first_save and n_try == 1:
                         return                                   # the lost save
+                    if overlapped and self.ts_overlap == "clobber":
+                        # last-writer-wins: this page's commit wipes the others
+                        for key in [k for k in self.ts_saved if k[0] == app_lot]:
+                            del self.ts_saved[key]
                     self.ts_saved[(app_lot, num)] = self.now()
                     self.last_ts_save_at = self.now()
                 return httpx.Response(302, headers=loc), commit
@@ -546,9 +569,14 @@ class Portal:
 
         @r.post(url__regex=rf".*/ajax_save_gamma_signs/{ANN}/{APP}$")
         async def save_signs(request):
+            self.signs_posts += 1
+
             def build():
                 if self.add_encrypt_done != set(self.lp_ids.values()):
-                    self.bad("save_gamma_signs before every add_encrypt committed")
+                    if self.signs_before_encrypt == "reject":
+                        return httpx.Response(200, json={"status": "error", "message": "no price"})
+                    if self.signs_before_encrypt == "violation":
+                        self.bad("save_gamma_signs before every add_encrypt committed")
                 return httpx.Response(200, json={"status": "ok"}), (lambda: setattr(self, "signs_saved", True))
             return await self.serve(request, P, build)
 
@@ -634,6 +662,7 @@ async def run_scenario(cfg: dict) -> dict:
                     auto_login_account_password=(None if cfg.get("no_password") else "pw"),
                     doc_save_mode=cfg.get("mode", "parallel_sessions"), tumar_api_key="k",
                     max_poll_wait_s=600.0,
+                    **flow.speed_options(cfg.get("defaults", {})),
                 )
                 error = None
                 state = None
@@ -676,6 +705,8 @@ async def run_scenario(cfg: dict) -> dict:
         "encr_info_calls": portal.encr_calls,
         "generated_files": portal.generated,
         "save_attempts": portal.save_attempts,
+        "ts_attempts": {f"{k[0]}/{k[1]}": v for k, v in portal.ts_attempts.items()},
+        "signs_posts": portal.signs_posts,
         "log": after_open if cfg.get("want_log") else None,
     }
 

@@ -29,7 +29,7 @@ import yaml
 
 from goszakup import secrets as gz_secrets
 from goszakup.client import GoszakupClient
-from goszakup.flow import AtagosBidParams, BeneficiaryInfo, submit_bid
+from goszakup.flow import AtagosBidParams, BeneficiaryInfo, speed_options, submit_bid
 from goszakup.local_signer import KalkanSigner
 from goszakup.state import StateStore
 from goszakup.tumar import TumarCSP
@@ -124,7 +124,7 @@ async def cmd_bid(cfg: dict, args) -> int:
         autofill_price_popup=bool(cfg["tumarcsp"].get("autofill_popup", False)),
         popup_coords=cfg["tumarcsp"].get("popup") or None,
         auto_login_account_password=acc_pw,
-        lot_barrier=str(cfg.get("defaults", {}).get("lot_barrier", "each")),
+        **speed_options(cfg.get("defaults", {})),
     )
     store = StateStore(Path(cfg["defaults"]["state_dir"]).expanduser())
     state = await submit_bid(

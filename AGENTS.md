@@ -137,3 +137,13 @@ Full write-up, numbers and the open list: `docs/PERFORMANCE_AUDIT.md`.
   a file after the bid and on `/timing`, and saves it to `<log_dir>/timing/`.
 - Not verified on the live portal yet. `defaults.lot_barrier` (each|last|none)
   is an opt-in experiment to be tried in dry-run.
+
+## Speed switches (21.11.2026) — trace #17947316
+
+`flow.speed_options(defaults)` feeds every entry point. `early_app_lots`
+(default ON) reads the тех.спец parent page while `lots_next` is in flight;
+`lot_save_parallel` and `gamma_parallel_saves` are opt-in experiments with a
+fallback each. The simulator models every portal reaction (`early_show_doc`,
+`ts_overlap`, `signs_before_encrypt`). Even with all of them the model gives
+~20 s at the live latencies: the rest is portal time (≥0.6 s per PHP request
+even off-peak). Details and the dry-run checklist: `docs/PERFORMANCE_AUDIT.md`.

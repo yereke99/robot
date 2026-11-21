@@ -373,7 +373,71 @@ class AtagosBidParams:
     # the docs_next self-heal re-saves it WITH barriers — a wrong guess costs
     # seconds, not the bid.
     lot_barrier: str = "each"
+    # ── Speed switches (docs/PERFORMANCE_AUDIT.md, "Трасса #17947316") ──
+    # Read the тех.спец parent page (tender_lot -> app_lot) WHILE lots_next is
+    # in flight instead of after it. Only that GET moves earlier — every write
+    # still waits for lots_next. A redirect or an incomplete page falls back to
+    # the usual discovery, raced against it, so the worst case is one extra GET.
+    early_app_lots: bool = True
+    # Commit the тех.спец sub-pages concurrently (the parent barrier, unless
+    # "none", runs once after all of them). EXPERIMENTAL: if the portal drops an
+    # overlapping page, docs_next names Приложение 15 and the self-heal re-saves
+    # it serially — a wrong guess costs seconds, not the bid.
+    lot_save_parallel: bool = False
+    # Send ajax_save_gamma_signs alongside the last ajax_add_encrypt instead of
+    # after it. Unless the reply is a recognisable success it is re-sent once
+    # the add_encrypt answer is in, so the worst case is the old order plus one
+    # repeated POST. EXPERIMENTAL.
+    gamma_parallel_saves: bool = False
     planned_price_ratio: Optional[float] = None
+
+
+def _config_flag(value, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def speed_options(defaults) -> dict:
+    """AtagosBidParams keyword arguments for the hot-path switches in the
+    ``defaults`` section of config.yaml — one place for every entry point."""
+    d = defaults or {}
+    return {
+        "lot_barrier": str(d.get("lot_barrier", "each")),
+        "early_app_lots": _config_flag(d.get("early_app_lots"), True),
+        "lot_save_parallel": _config_flag(d.get("lot_save_parallel"), False),
+        "gamma_parallel_saves": _config_flag(d.get("gamma_parallel_saves"), False),
+    }
+
+
+def _reply_verdict(r) -> str:
+    """"ok" / "error" / "unknown" for a small portal AJAX reply. Only a
+    recognisable success is "ok": callers that may skip a repeat must not treat
+    an unfamiliar body as proof the write happened."""
+    status_code = getattr(r, "status_code", 200)
+    if not isinstance(status_code, int) or status_code >= 300:
+        return "error"
+    try:
+        j = r.json()
+    except Exception:  # noqa: BLE001 — HTML, empty or truncated body
+        return "unknown"
+    if not isinstance(j, dict):
+        return "unknown"
+    if j.get("error") or j.get("errors"):
+        return "error"
+    for key in ("status", "result", "success"):
+        if key not in j:
+            continue
+        value = j[key]
+        if isinstance(value, str):
+            value = value.strip().lower()
+        if value in ("ok", "success", "true", "1", 1, True):
+            return "ok"
+        if value in ("error", "fail", "failed", "false", "0", 0, False):
+            return "error"
+    return "unknown"
 
 
 def _is_tech_spec_reject(msg: Optional[str]) -> bool:
@@ -773,8 +837,14 @@ async def submit_bid(
             log.info("flow.created", app_id=app_id)
 
             # === add_lots + lots_next FIRST (server requires them before doc generation) ===
-            await gz.add_lots(params.announce_id, app_id, params.tender_lot_ids)
+            add_lots_reply = await gz.add_lots(params.announce_id, app_id, params.tender_lot_ids)
             _mark(state, "lots_selected")
+            # The app_lot ids exist once add_lots answers. Read them while
+            # lots_next is in flight; nothing is written before lots_next ends.
+            early_lots_task = None
+            if params.early_app_lots:
+                early_lots_task = asyncio.create_task(_probe_app_lots(gz, params, app_id))
+                stack.push_async_callback(_cancel_task, early_lots_task)
             await gz.lots_next(params.announce_id, app_id)
             state.step = "lots_added"
             _mark(state, "lots_done")
@@ -797,6 +867,7 @@ async def submit_bid(
                     )
                     params.doc_plan = _adapt_doc_plan(params.doc_plan, docs_html or "")
                     docs_titles.update(_doc_titles(docs_html or ""))
+                    _note_early_lp_ids(docs_html or "", "docs_page")
                     return docs_html
                 except Exception as e:  # noqa: BLE001 — keep DEFAULT_DOC_PLAN
                     log.warning("flow.doc_plan.adapt_failed", err=str(e)[:120])
@@ -805,7 +876,8 @@ async def submit_bid(
             docs_page_task = asyncio.create_task(_load_docs_page())
             stack.push_async_callback(_cancel_task, docs_page_task)
             app_lots_task = asyncio.create_task(
-                _discover_app_lots(gz, params, app_id, docs_page_task=docs_page_task)
+                _resolve_app_lots(gz, params, app_id, early=early_lots_task,
+                                  docs_page_task=docs_page_task)
             )
             stack.push_async_callback(_cancel_task, app_lots_task)
 
@@ -844,6 +916,13 @@ async def submit_bid(
             try:
                 app_lot_map = await app_lots_task
                 log.info("flow.app_lot_map", mapping=app_lot_map)
+                # If the add_lots reply already names the app_lot ids, a later
+                # change can drop the discovery GET altogether. Record it.
+                reply_text = getattr(add_lots_reply, "text", "") or ""
+                log.info("flow.add_lots.app_lot_in_reply",
+                         ok=bool(app_lot_map) and all(
+                             str(al) in reply_text for al in app_lot_map.values()),
+                         len=len(reply_text))
                 # the plan (agreement id) must be final before the doc phase reads it
                 await asyncio.shield(docs_page_task)
             except AlreadyAtPriceStage:
@@ -968,6 +1047,71 @@ async def submit_bid(
         )
 
     return state
+
+
+def _note_early_lp_ids(html_text: str, source: str) -> None:
+    """Diagnostics only: does a page read BEFORE the price stage already carry
+    the lot-point ids (buy_lot_point_id)? If so, ajax_get_encr_info could start
+    alongside the price page GET instead of after it."""
+    if html_text and "buy_lot_point_id" in html_text:
+        n = len(set(re.findall(r'buy_lot_point_id\D{0,4}(\d+)', html_text)))
+        log.info("flow.lp_id.early_seen", source=source, n=n)
+
+
+async def _probe_app_lots(gz, params, app_id) -> Optional[dict[int, int]]:
+    """One read of the тех.спец parent page, sent while lots_next is in flight.
+
+    Never raises (except on cancellation) and never follows a redirect: a page
+    gated on lots_next just yields None and the normal discovery takes over.
+    Accepted only when EVERY tender lot maps to a distinct app_lot that appears
+    in a sub-page link of THIS application and document."""
+    ann = params.announce_id
+    lot_doc = next((s.doc_id for s in params.doc_plan if s.kind == "lot_sign"), 3334)
+    try:
+        r = await gz._http.get(f"/ru/application/show_doc/{ann}/{app_id}/{lot_doc}",
+                               follow_redirects=False)
+        html_text = r.text if r.status_code == 200 else ""
+        _note_early_lp_ids(html_text, "lot_parent")
+        got = _extract_app_lot_mapping(html_text, params.tender_lot_ids) if html_text else {}
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — the fallback discovery still runs
+        log.info("flow.app_lots.early_miss", error_type=type(exc).__name__)
+        return None
+    marker = f"/{ann}/{app_id}/{lot_doc}/"
+    if (not got or len(got) != len(params.tender_lot_ids)
+            or len(set(got.values())) != len(got)
+            or any(f"{marker}{al}/" not in html_text for al in got.values())):
+        log.info("flow.app_lots.early_miss", status=r.status_code, n=len(got))
+        return None
+    log.info("flow.app_lots.early_hit", n=len(got))
+    return got
+
+
+async def _resolve_app_lots(gz, params, app_id, *, early=None, docs_page_task=None) -> dict[int, int]:
+    """The early probe's mapping if it has one, otherwise the usual discovery.
+    While the probe is still out, the usual discovery starts too and the first
+    complete answer wins — waiting on a probe that may be redirected would only
+    add its latency to the documents."""
+    if early is not None and early.done():
+        got = None if early.cancelled() else early.result()
+        if got:
+            return got
+        early = None
+    if early is None:
+        return await _discover_app_lots(gz, params, app_id, docs_page_task=docs_page_task)
+    normal = asyncio.ensure_future(
+        _discover_app_lots(gz, params, app_id, docs_page_task=docs_page_task))
+    try:
+        done, _ = await asyncio.wait({early, normal}, return_when=asyncio.FIRST_COMPLETED)
+        if early in done and not early.cancelled() and early.result():
+            log.info("flow.app_lots.early_won")
+            return early.result()
+        return await normal
+    finally:
+        if not normal.done():
+            normal.cancel()
+            await asyncio.gather(normal, return_exceptions=True)
 
 
 async def _discover_app_lots(gz, params, app_id, *, docs_page_task=None) -> dict[int, int]:
@@ -1389,7 +1533,10 @@ async def _run_doc_in_session(
     ann = params.announce_id
     needs_barrier = spec.kind == "lot_sign"
     barrier_mode = _lot_barrier_mode(params) if needs_barrier else "none"
+    # Concurrent sub-page commits: one parent barrier after all of them.
+    parallel = needs_barrier and bool(getattr(params, "lot_save_parallel", False))
     committed: set[int] = set()
+    pending: list[asyncio.Future] = []
 
     async def _barrier() -> None:
         try:
@@ -1401,17 +1548,40 @@ async def _run_doc_in_session(
         await op.run(sib)
         committed.add(id(op))
         log.info("flow.doc.saved.isolated", label=op.label, doc=op.doc_id)
-        if barrier_mode == "each":
+        if barrier_mode == "each" and not parallel:
             await _barrier()
 
-    ops = await _prepare_doc(
-        sib, sib_ns, params, app_id, app_lot_map, beneficiary, base_url, spec,
-        sig_cache=sig_cache, on_ready=_commit if needs_barrier else None,
-        checked_beneficiary_file=checked_beneficiary_file)
+    async def _on_ready(op: _SaveOp) -> None:
+        if parallel:
+            pending.append(asyncio.ensure_future(_commit(op)))
+        else:
+            await _commit(op)
+
+    async def _settle() -> None:
+        # A save already on the wire is let finish: cancelling it would leave
+        # the page's state unknown. The first failure is re-raised afterwards.
+        if not pending:
+            return
+        results = await asyncio.gather(*pending, return_exceptions=True)
+        pending.clear()
+        for res in results:
+            if isinstance(res, BaseException):
+                raise res
+
+    try:
+        ops = await _prepare_doc(
+            sib, sib_ns, params, app_id, app_lot_map, beneficiary, base_url, spec,
+            sig_cache=sig_cache, on_ready=_on_ready if needs_barrier else None,
+            checked_beneficiary_file=checked_beneficiary_file)
+    except BaseException:
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        raise
+    await _settle()
     for op in ops:
         if id(op) not in committed:
             await _commit(op)
-    if barrier_mode == "last" and ops:
+    if ops and (barrier_mode == "last" or (parallel and barrier_mode == "each")):
         await _barrier()
     return ops
 
@@ -1933,6 +2103,8 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None, warm_r
     encrypted_by_pair: dict[tuple[int, int], str] = {}
     prices_by_lp: dict[int, float] = {}
     signatures = {}
+    parallel_signs = bool(getattr(params, "gamma_parallel_saves", False))
+    last_add = None   # the final add_encrypt, still in flight (parallel_signs)
     async with AsyncExitStack() as tasks:
         # A salt belongs to this application and price request. Fetch it once
         # per lot, after the portal accepts the documents, using the live version.
@@ -1942,7 +2114,7 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None, warm_r
             tasks.push_async_callback(_cancel_task, task)
             encr_info[lp_id] = task
 
-        for app_lot, lp_id in pairs:
+        for idx, (app_lot, lp_id) in enumerate(pairs):
             raw = await encr_info[lp_id]
             log.info("flow.get_encr_info.received", lp_id=lp_id, keys=sorted(raw))
             info = _parse_encr_info(
@@ -1963,11 +2135,18 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None, warm_r
             signing = asyncio.create_task(ns.sign_xml_batch({lp_id: enc.encrypted_data}))
             tasks.push_async_callback(_cancel_task, signing)
             signatures[lp_id] = signing
-            await gz.add_encrypt(
+            add_call = gz.add_encrypt(
                 ann, app_id, item_id=lp_id,
                 encrypted_data=enc.encrypted_data, session_key=enc.session_key,
                 salt=info.salt, info=enc.info, sign=enc.sign,
             )
+            if parallel_signs and idx == len(pairs) - 1:
+                # Kept on the outer stack: this block's exit must not cancel a
+                # price write that is already on the wire.
+                last_add = asyncio.ensure_future(add_call)
+                stack.push_async_callback(_cancel_task, last_add)
+            else:
+                log.info("flow.gamma.add_encrypt", verdict=_reply_verdict(await add_call))
             if signing.done():
                 signing.result()
 
@@ -1977,8 +2156,23 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None, warm_r
         }
 
     # 5. save all gamma signatures, then advance with the encrypted prices
-    await gz.save_gamma_signs(ann, app_id, signs_by_lp=signs_by_lp)
-    await gz.priceoffers_next_gamma(ann, app_id, prices=encrypted_by_pair)
+    if last_add is not None:
+        signs_reply = asyncio.ensure_future(
+            gz.save_gamma_signs(ann, app_id, signs_by_lp=signs_by_lp))
+        stack.push_async_callback(_cancel_task, signs_reply)
+        add_reply, signs_reply = await asyncio.gather(last_add, signs_reply)
+        add_verdict, signs_verdict = _reply_verdict(add_reply), _reply_verdict(signs_reply)
+        log.info("flow.gamma.parallel_signs", verdict=signs_verdict, source=add_verdict)
+        if signs_verdict != "ok":
+            # Not a recognisable success: repeat it now that add_encrypt is in —
+            # exactly the old order, one POST later.
+            signs_reply = await gz.save_gamma_signs(ann, app_id, signs_by_lp=signs_by_lp)
+            log.info("flow.gamma.signs_resent", verdict=_reply_verdict(signs_reply))
+    else:
+        signs_reply = await gz.save_gamma_signs(ann, app_id, signs_by_lp=signs_by_lp)
+        log.info("flow.gamma.save_signs", verdict=_reply_verdict(signs_reply))
+    next_reply = await gz.priceoffers_next_gamma(ann, app_id, prices=encrypted_by_pair)
+    log.info("flow.gamma.priceoffers_next", verdict=_reply_verdict(next_reply))
     log.info("flow.gamma.done", dt_s=round(time.time() - t_gamma0, 3),
              n_lots=len(pairs))
     return discovered_lp_ids, prices_by_lp

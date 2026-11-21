@@ -252,3 +252,101 @@ def test_slow_portal_budget():
     result = _run({"G": 1.6, "P": 0.7, "lag": 2.0})
     _assert_submitted(result)
     assert result["from_open_s"] < 23.0
+
+
+# ── Speed switches (docs/PERFORMANCE_AUDIT.md, «Трасса #17947316») ──────────
+# Latencies of the live trace: create 2.75 s, ~1 s per POST, ~1.2 s per page.
+LIVE = {"G": 1.2, "P": 1.0, "create_post": 2.75, "lots_discovery_get": 0.66,
+        "public_delay": 2.73, "docs_get": 1.6, "dl_base": 1.0, "dl_rate": 50e6,
+        "lag": 0.5, "tsa": 0.31, "popup": 0.30}
+LIVE_OFF = {"lot_barrier": "last", "early_app_lots": False}
+ALL_ON = {**LIVE_OFF, "early_app_lots": True, "lot_save_parallel": True,
+          "gamma_parallel_saves": True}
+
+
+def _paths(result, needle):
+    return [req for req in result["log"] if needle in req["path"]]
+
+
+def test_early_app_lots_reads_the_mapping_while_lots_next_runs():
+    off = _run({**LIVE, "ts_overlap": "accept", "defaults": LIVE_OFF})
+    on = _run({**LIVE, "ts_overlap": "accept", "early_show_doc": "serve", "want_log": True,
+               "defaults": {**LIVE_OFF, "early_app_lots": True}})
+    _assert_submitted(off)
+    _assert_submitted(on)
+    lots_next = _paths(on, "/ajax_lots_next/")[0]
+    parent = [r for r in on["log"] if r["path"].endswith("/3334") and r["m"] == "GET"][0]
+    assert parent["t0"] < lots_next["t1"]                     # read overlaps lots_next
+    first_write = min(r["t0"] for r in on["log"] if r["m"] == "POST"
+                      and ("/show_doc/" in r["path"] or "ajax_save_info" in r["path"]))
+    assert first_write >= lots_next["t1"]                     # nothing written early
+    assert on["from_open_s"] <= off["from_open_s"] - 0.8
+
+
+def test_early_app_lots_falls_back_when_the_page_is_stage_gated():
+    off = _run({**LIVE, "ts_overlap": "accept", "defaults": LIVE_OFF})
+    on = _run({**LIVE, "ts_overlap": "accept", "early_show_doc": "redirect",
+               "defaults": {**LIVE_OFF, "early_app_lots": True}})
+    _assert_submitted(on)
+    assert on["from_open_s"] <= off["from_open_s"] + 0.01      # costs one GET, no time
+
+
+def test_parallel_tech_spec_saves_overlap_and_keep_one_barrier():
+    off = _run({**LIVE, "ts_overlap": "accept", "defaults": LIVE_OFF})
+    on = _run({**LIVE, "ts_overlap": "accept", "want_log": True,
+               "defaults": {**LIVE_OFF, "lot_save_parallel": True}})
+    _assert_submitted(on)
+    saves = [r for r in on["log"] if r["m"] == "POST" and "/3334/85000001/" in r["path"]]
+    assert len(saves) == 2 and saves[1]["t0"] < saves[0]["t1"]
+    barrier = [r for r in on["log"] if r["m"] == "GET" and r["path"].endswith("/3334")
+               and r["t0"] >= max(s["t1"] for s in saves)]
+    assert len(barrier) == 1
+    assert set(on["ts_attempts"].values()) == {1}
+    assert on["from_open_s"] <= off["from_open_s"] - 1.0
+
+
+def test_parallel_tech_spec_saves_are_healed_when_the_portal_drops_one():
+    result = _run({**LIVE, "ts_overlap": "clobber",
+                   "defaults": {**LIVE_OFF, "lot_save_parallel": True}})
+    _assert_submitted(result)
+    assert max(result["ts_attempts"].values()) == 2           # the lost page re-saved
+
+
+def test_gamma_signs_go_with_add_encrypt_when_accepted():
+    off = _run({**LIVE, "ts_overlap": "accept", "defaults": LIVE_OFF})
+    on = _run({**LIVE, "ts_overlap": "accept", "signs_before_encrypt": "accept",
+               "want_log": True, "defaults": {**LIVE_OFF, "gamma_parallel_saves": True}})
+    _assert_submitted(on)
+    add = _paths(on, "/ajax_add_encrypt/")[0]
+    signs = _paths(on, "/ajax_save_gamma_signs/")
+    nxt = _paths(on, "/ajax_priceoffers_next/")[0]
+    assert len(signs) == 1 and signs[0]["t0"] < add["t1"]
+    assert nxt["t0"] >= max(add["t1"], signs[0]["t1"])
+    assert on["from_open_s"] <= off["from_open_s"] - 0.6
+
+
+def test_gamma_signs_are_resent_after_add_encrypt_when_refused():
+    off = _run({**LIVE, "ts_overlap": "accept", "defaults": LIVE_OFF})
+    on = _run({**LIVE, "ts_overlap": "accept", "signs_before_encrypt": "reject",
+               "want_log": True, "defaults": {**LIVE_OFF, "gamma_parallel_saves": True}})
+    _assert_submitted(on)
+    add = _paths(on, "/ajax_add_encrypt/")[0]
+    signs = _paths(on, "/ajax_save_gamma_signs/")
+    assert on["signs_posts"] == 2 and signs[1]["t0"] >= add["t1"]
+    # Worst case: the old order plus the TSA signature the first try waited on.
+    assert on["from_open_s"] <= off["from_open_s"] + LIVE["tsa"] + 0.01
+
+
+def test_all_switches_on_live_latencies_and_tolerant_portal():
+    result = _run({**LIVE, "ts_overlap": "accept", "early_show_doc": "serve",
+                   "signs_before_encrypt": "accept", "defaults": ALL_ON})
+    _assert_submitted(result)
+    assert result["from_open_s"] < 21.0
+
+
+@pytest.mark.parametrize("lots", [1, 2])
+def test_all_switches_multi_lot_strict_portal_still_submits(lots):
+    result = _run({**FAST, "lots": lots, "lag": 1.0, "ts_overlap": "accept",
+                   "early_show_doc": "redirect", "signs_before_encrypt": "reject",
+                   "defaults": ALL_ON})
+    _assert_submitted(result)
