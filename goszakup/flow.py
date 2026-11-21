@@ -326,8 +326,7 @@ class AtagosBidParams:
     tumar: Optional[TumarCSP] = None  # injected long-lived TumarCSP (bot)
     tumar_api_key: Optional[str] = None
     tumar_ws_url: str = "wss://127.0.0.1:6127/tumarcsp/"
-    # Auto-fill the TumarCSP price popup (Windows/pywinauto). Falls back to
-    # manual entry if it can't (see popup_filler.py).
+    # The Windows provider uses verified autofill (see popup_filler.py).
     autofill_price_popup: bool = False
     # Optional absolute-coordinate fallback for the popup (this machine only),
     # used when the window can't be enumerated. {field_xy, ok_xy, detect_xy,
@@ -1773,9 +1772,7 @@ async def _open_tumar(params, stack):
     if not params.tumar_api_key:
         raise RuntimeError("gamma price needs tumar_api_key (or an injected TumarCSP)")
     autofill = None
-    # Force-enable popup auto-fill whenever the platform supports it (Windows +
-    # pywinauto), regardless of the config flag — the popup must be driven
-    # automatically. config tumarcsp.popup.* coords are the fallback.
+    # On Windows the built-in filler enters the price into the provider's dialog.
     from .popup_filler import is_supported, make_autofiller
     if is_supported():
         pc = params.popup_coords or {}
@@ -1785,11 +1782,10 @@ async def _open_tumar(params, stack):
             detect_xy=pc.get("detect_xy"), detect_rgb=pc.get("detect_rgb"),
         )
         log.info("flow.gamma.autofill.enabled", forced=True,
-                 config_flag=params.autofill_price_popup,
-                 coords_fallback=bool(pc.get("field_xy")))
+                 config_flag=params.autofill_price_popup)
     else:
         log.warning("flow.gamma.autofill.unsupported",
-                    hint="not Windows or pywinauto missing — manual price entry")
+                    hint="manual entry is available outside the Windows autofill path")
     return await stack.enter_async_context(
         TumarCSP(api_key=params.tumar_api_key, ws_url=params.tumar_ws_url, autofill=autofill)
     )

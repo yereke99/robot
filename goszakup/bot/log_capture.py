@@ -198,6 +198,7 @@ _PUBLIC_RANGE_VERDICTS = {
 _PUBLIC_BID_JOURNAL = {
     "flow.docs_next", "flow.docs_next.retry", "flow.docs_next.resaved",
     "local_signer.range.eligibility", "local_signer.range.used",
+    "tumar.encrypt.autofill.confirmed", "tumar.encrypt.provider_reply",
 }
 _PUBLIC_PHASES = {
     "t0", "created", "lots_selected", "lots_done", "docs_signed", "docs_accepted",

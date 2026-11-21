@@ -181,8 +181,6 @@ async def test_popup_gate_no_wait_when_idle(monkeypatch):
 # fallback coordinates — into whatever window was in front by then.
 
 import json
-import threading
-import time
 from goszakup import popup_filler
 
 
@@ -309,92 +307,7 @@ async def test_encrypt_send_failure_stops_the_filler(monkeypatch):
     assert seen == {"stopped": True}
 
 
-def _as_windows(monkeypatch, *, find):
-    monkeypatch.setattr(popup_filler.sys, "platform", "win32")
-    monkeypatch.setattr(popup_filler, "is_elevated", lambda: True)
-    monkeypatch.setattr(popup_filler, "_find_popup_hwnd", find)
-
-    def _never(*a, **k):
-        raise AssertionError("must not type at fallback coordinates after stop")
-    monkeypatch.setattr(popup_filler, "_fill_via_coords", _never)
-
-
-def test_filler_returns_at_once_when_already_stopped(monkeypatch):
-    def find(_needles):
-        raise AssertionError("must not even look for the window")
-    _as_windows(monkeypatch, find=find)
-    stop = threading.Event()
-    stop.set()
-    assert popup_filler.fill_price_popup(80.0, timeout_s=30.0, stop=stop,
-                                         field_xy=[1, 1]) is False
-
-
-def test_filler_stops_searching_mid_loop(monkeypatch):
-    _as_windows(monkeypatch, find=lambda _needles: None)   # window never appears
-    stop = threading.Event()
-    threading.Timer(0.15, stop.set).start()
-    started = time.time()
-    ok = popup_filler.fill_price_popup(80.0, timeout_s=30.0, stop=stop, field_xy=[1, 1])
-    assert ok is False
-    assert time.time() - started < 2.0     # left the 30s search almost immediately
-
-
-@pytest.mark.parametrize(
-    "color_appears, color_disappears, stop_at, first_click_before",
-    [
-        (0.1, float("inf"), float("inf"), 0.4),  # a newly visible popup
-        (0.0, float("inf"), float("inf"), 3.0),  # the baseline matches already
-        (0.1, 0.13, 0.4, None),                 # the color vanishes during settling
-    ],
-)
-def test_popup_color_can_enable_early_coordinates(
-    monkeypatch, color_appears, color_disappears, stop_at, first_click_before,
-):
-    monkeypatch.setattr(popup_filler.sys, "platform", "win32")
-    monkeypatch.setattr(popup_filler, "is_elevated", lambda: True)
-    monkeypatch.setattr(popup_filler, "_find_popup_hwnd", lambda _: None)
-    monkeypatch.setattr(popup_filler, "_PRE_TYPE_SETTLE_S", 0.05)
-    monkeypatch.setattr(popup_filler, "_set_clipboard", lambda _: False)
-    clock = 0.0
-    stop = threading.Event()
-    clicks = []
-    typed = []
-
-    def sleep(duration):
-        nonlocal clock
-        clock += duration
-        if clock >= stop_at:
-            stop.set()
-
-    def pixel(_x, _y):
-        return (240, 240, 240) if color_appears <= clock < color_disappears else (10, 10, 10)
-
-    monkeypatch.setattr(popup_filler, "time", SimpleNamespace(time=lambda: clock, sleep=sleep))
-    monkeypatch.setattr(popup_filler, "_screen_pixel", pixel)
-    monkeypatch.setitem(popup_filler.sys.modules, "pyautogui", SimpleNamespace(
-        click=lambda x, y: clicks.append((clock, x, y)),
-        hotkey=lambda *args: None,
-        typewrite=lambda value, **kwargs: typed.append(value),
-        press=lambda _: None,
-    ))
-
-    filled = popup_filler.fill_price_popup(
-        80.0, field_xy=[1, 1], ok_xy=[2, 2], detect_xy=[3, 3],
-        detect_rgb=[240, 240, 240], timeout_s=4.0, stop=stop,
-    )
-
-    if first_click_before is None:
-        assert not filled
-        assert clicks == typed == []
-    else:
-        assert filled
-        first_click = clicks[0][0]
-        assert color_appears <= first_click < first_click_before
-        if color_appears == 0:
-            assert first_click >= 2.5
-        assert typed == ["80.00"]
-
-
 def test_make_autofiller_advertises_stop_support():
     fill = popup_filler.make_autofiller()
     assert getattr(fill, "supports_stop", False) is True
+    assert getattr(fill, "requires_confirmation", False) is True

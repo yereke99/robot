@@ -54,15 +54,11 @@ log = structlog.get_logger("tumar")
 DEFAULT_WS_URL = "wss://127.0.0.1:6127/tumarcsp/"
 
 # --- process-global price-popup gate -----------------------------------------
-# The price popup is filled by simulating keystrokes at FIXED screen
-# coordinates (popup_filler.py). With several tenders running concurrently, two
-# EncryptOfferPrice calls would open two popups fighting over the same
-# coordinates — the wrong price could land in the wrong window, and we can't
-# read back the field to notice. So popups are serialized PROCESS-WIDE: only one
-# is ever on screen, each fill carries its own price, and consecutive popups are
-# spaced >= _POPUP_MIN_SPACING_S apart so the previous one is fully gone first.
+# The local provider has one price dialog per active request. Serialize requests
+# process-wide so each fill belongs to its offer, with a small gap after each.
 _POPUP_LOCK = asyncio.Lock()
 _POPUP_MIN_SPACING_S = 1.5
+_AUTO_POPUP_TIMEOUT_S = 6.0
 _popup_last_release = 0.0
 
 
@@ -90,6 +86,17 @@ async def _popup_gate(label: str = ""):
 
 class TumarError(RuntimeError):
     """TumarCSP returned an error or is unreachable."""
+
+
+def _encrypted_reply(raw: str) -> dict:
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise TumarError("TumarCSP вернул некорректный ответ на шифрование цены.") from exc
+    if (not isinstance(result, dict) or str(result.get("result")).lower() != "true"
+            or not result.get("encryptData") or not result.get("encryptKey")):
+        raise TumarError(f"TumarCSP отклонил шифрование цены: {result}")
+    return result
 
 
 @dataclass
@@ -160,7 +167,7 @@ class TumarCSP:
         origin: str = DEFAULT_ORIGIN,
         timeout_s: float = 15.0,
         encrypt_timeout_s: float = 300.0,
-        autofill: Optional[Callable[[float], bool]] = None,
+        autofill: Optional[Callable[..., bool]] = None,
     ):
         self._api_key = api_key
         self._ws_url = ws_url
@@ -170,9 +177,8 @@ class TumarCSP:
         # (see popup_filler.py). Runs in a worker thread while we await the
         # WS reply. If None or it fails, the operator types the price by hand.
         self._autofill = autofill
-        # EncryptOfferPrice opens a TumarCSP GUI popup where a human types the
-        # price (gamma tenders seal the price inside the trusted module). Give
-        # that step a long timeout so the operator has time to enter + confirm.
+        # The supported interactive path allows time for manual confirmation.
+        # The built-in Windows bot uses its own shorter deadline.
         self._encrypt_timeout_s = encrypt_timeout_s
         self._connect_lock = asyncio.Lock()
         self._ws = None
@@ -264,6 +270,76 @@ class TumarCSP:
             raise TumarError(f"GetVersion failed: {resp}")
         return str(resp.get("response", ""))
 
+    async def _finish_popup(self, started, stop, fill_task, *, cleanup_s: float = 5.0) -> None:
+        stop.set()
+        trace_event("tumar", "EncryptOfferPrice (окно цены)", started)
+        log.info("tumar.encrypt.popup_done", dt_s=round(time.monotonic() - started, 3))
+        if fill_task is not None:
+            cleanup_started = time.monotonic()
+            try:
+                ok = await asyncio.wait_for(asyncio.shield(fill_task), timeout=cleanup_s)
+                log.info("tumar.encrypt.autofill.result", ok=ok)
+            except Exception:
+                fill_task.cancel()
+            finally:
+                trace_event("tumar", "Завершение автозаполнения", cleanup_started)
+
+    async def _request_price_automatically(self, ws, payload: dict, price: float) -> dict:
+        started = time.monotonic()
+        stop = threading.Event()
+        loop = asyncio.get_running_loop()
+        ready = asyncio.Event()
+        fill = asyncio.create_task(asyncio.to_thread(
+            self._autofill, price, stop, ready=lambda: loop.call_soon_threadsafe(ready.set),
+        ))
+        baseline = asyncio.create_task(ready.wait())
+        reply = None
+        complete = False
+
+        async def receive() -> dict:
+            raw = await ws.recv()
+            log.info("tumar.encrypt.provider_reply", elapsed_s=round(time.monotonic() - started, 3))
+            return _encrypted_reply(raw)
+
+        try:
+            async with asyncio.timeout(_AUTO_POPUP_TIMEOUT_S):
+                await asyncio.wait((baseline, fill), return_when=asyncio.FIRST_COMPLETED)
+                if fill.done():
+                    raise TumarError("Не удалось подготовить поиск окна цены TumarCSP.")
+                log.info("tumar.encrypt.autofill.start")
+                await ws.send(json.dumps(payload, ensure_ascii=False))
+                reply = asyncio.create_task(receive())
+                done, _ = await asyncio.wait((reply, fill), return_when=asyncio.FIRST_COMPLETED)
+                encrypted = reply.result() if reply in done else None
+                try:
+                    confirmed = await asyncio.shield(fill)
+                except Exception as exc:
+                    raise TumarError("Ошибка при автоматическом вводе цены TumarCSP.") from exc
+                if not confirmed:
+                    raise TumarError("Бот не смог подтвердить точную цену в окне TumarCSP.")
+                log.info("tumar.encrypt.autofill.confirmed", elapsed_s=round(time.monotonic() - started, 3))
+                if encrypted is None:
+                    encrypted = await reply
+                complete = True
+                return encrypted
+        except TimeoutError as exc:
+            raise TumarError("Истекло время автоматического подтверждения цены TumarCSP.") from exc
+        finally:
+            stop.set()
+            if not complete and self._ws is ws:
+                self._ws = None
+            try:
+                baseline.cancel()
+                await asyncio.gather(baseline, return_exceptions=True)
+                if reply is not None:
+                    reply.cancel()
+                    await asyncio.gather(reply, return_exceptions=True)
+                await self._finish_popup(started, stop, fill, cleanup_s=1.0)
+            finally:
+                if not complete:
+                    with suppress(Exception):
+                        await asyncio.wait_for(ws.close(), timeout=1.0)
+
     async def encrypt_offer_price(self, info: EncrInfo) -> EncryptResult:
         """Seal one lot-point price. ``info`` comes straight from ajax_get_encr_info.
 
@@ -289,11 +365,8 @@ class TumarCSP:
         log.info("tumar.encrypt.param_keys", keys=sorted(param),
                  has_public_key=bool(info.public_key))
 
-        # Sending EncryptOfferPrice pops the TumarCSP price window. We fire the
-        # auto-filler in a worker thread (it waits for the window, types the
-        # price, clicks OK) while we await the WS reply. No filler / failure →
-        # the window waits for the operator (long timeout).
-        assert self._ws is not None, "TumarCSP not connected"
+        # EncryptOfferPrice opens the provider's dialog. The built-in Windows
+        # filler verifies the field; explicit interactive callers can enter it.
         payload = {"TumarCSP": "EFCAPI", "Function": "EncryptOfferPrice", "Param": param}
 
         # Hold the global popup gate across send -> fill -> recv: the popup is on
@@ -301,54 +374,13 @@ class TumarCSP:
         # popup meanwhile (and the next one waits out the spacing). Each gate
         # acquisition types exactly THIS offer's d_sum.
         async with _popup_gate(label=info.id_priceoffer):
-            # Start the filler BEFORE EncryptOfferPrice so it is already
-            # polling when the dialog appears — otherwise the first paint
-            # is often missed and the operator has to type by hand.
-            fill_task = None
-            # Lets us tell the filler thread "the popup is done, stop looking".
-            fill_stop = threading.Event()
-            t_popup_mono = time.monotonic()
-            try:
-                if self._autofill is not None:
-                    log.info("tumar.encrypt.autofill.start", price=info.d_sum,
-                             id_priceoffer=info.id_priceoffer)
-                    if getattr(self._autofill, "supports_stop", False):
-                        fill_call = asyncio.to_thread(self._autofill, info.d_sum, fill_stop)
-                    else:
-                        fill_call = asyncio.to_thread(self._autofill, info.d_sum)
-                    fill_task = asyncio.ensure_future(fill_call)
-                    await asyncio.sleep(0.05)
-                else:
-                    log.info("tumar.encrypt.waiting_for_popup",
-                             hint="type the price and click OK in the TumarCSP popup")
-
-                await self._ws.send(json.dumps(payload, ensure_ascii=False))
-                raw = await asyncio.wait_for(self._ws.recv(), timeout=self._encrypt_timeout_s)
-            finally:
-                # TumarCSP answered (or we gave up): the popup is finished. Stop
-                # the filler NOW. Without this a filler that had not found the
-                # window (price typed by hand, popup dismissed) kept us waiting
-                # here 5s more, then lived on as an un-cancellable thread that
-                # could type the price at the fallback coordinates a minute later.
-                fill_stop.set()
-                trace_event("tumar", "EncryptOfferPrice (окно цены)", t_popup_mono)
-                log.info("tumar.encrypt.popup_done",
-                         dt_s=round(time.monotonic() - t_popup_mono, 3))
-                if fill_task is not None:
-                    cleanup_started = time.monotonic()
-                    try:
-                        ok = await asyncio.wait_for(asyncio.shield(fill_task), timeout=5.0)
-                        log.info("tumar.encrypt.autofill.result", ok=ok)
-                    except Exception:
-                        fill_task.cancel()
-                    finally:
-                        trace_event("tumar", "Завершение автозаполнения", cleanup_started)
-        try:
-            resp = json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise TumarError(f"non-JSON EncryptOfferPrice reply: {raw[:200]!r}") from e
-        if str(resp.get("result")).lower() != "true" or "encryptData" not in resp:
-            raise TumarError(f"EncryptOfferPrice failed: {resp}")
+            ws = self._ws
+            if ws is None:
+                raise TumarError("Соединение с TumarCSP закрыто. Запусти новую попытку.")
+            if getattr(self._autofill, "requires_confirmation", False):
+                resp = await self._request_price_automatically(ws, payload, info.d_sum)
+            else:
+                resp = await self._request_price_interactively(ws, payload, info)
         log.info(
             "tumar.encrypted",
             id_priceoffer=info.id_priceoffer,
@@ -363,3 +395,31 @@ class TumarCSP:
             sign=resp.get("sign", ""),
             code=str(resp.get("code", "0")),
         )
+
+    async def _request_price_interactively(self, ws, payload: dict, info: EncrInfo) -> dict:
+        # Start the filler BEFORE EncryptOfferPrice so it is already
+        # polling when the dialog appears — otherwise the first paint
+        # is often missed and the operator has to type by hand.
+        fill_task = None
+        # Lets us tell the filler thread "the popup is done, stop looking".
+        fill_stop = threading.Event()
+        t_popup_mono = time.monotonic()
+        try:
+            if self._autofill is not None:
+                log.info("tumar.encrypt.autofill.start", price=info.d_sum,
+                         id_priceoffer=info.id_priceoffer)
+                if getattr(self._autofill, "supports_stop", False):
+                    fill_call = asyncio.to_thread(self._autofill, info.d_sum, fill_stop)
+                else:
+                    fill_call = asyncio.to_thread(self._autofill, info.d_sum)
+                fill_task = asyncio.ensure_future(fill_call)
+                await asyncio.sleep(0.05)
+            else:
+                log.info("tumar.encrypt.waiting_for_popup",
+                         hint="type the price and click OK in the TumarCSP popup")
+
+            await ws.send(json.dumps(payload, ensure_ascii=False))
+            raw = await asyncio.wait_for(ws.recv(), timeout=self._encrypt_timeout_s)
+        finally:
+            await self._finish_popup(t_popup_mono, fill_stop, fill_task)
+        return _encrypted_reply(raw)
