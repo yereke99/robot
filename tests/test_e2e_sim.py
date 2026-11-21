@@ -45,6 +45,31 @@ def test_clean_bid_runs_the_whole_chain_in_order():
     assert result["from_open_s"] < 11.0
 
 
+def test_status_only_create_discovers_the_draft_before_selecting_lots():
+    result = _run({
+        **FAST, "lag": 0.0, "want_log": True, "create_status_only": True,
+        "create_post": 2.625, "lots_discovery_get": 0.704, "public_delay": 2.438,
+    })
+    _assert_submitted(result)
+
+    ann, app = sim_portal.ANN, sim_portal.APP
+    stage = [
+        ("POST", f"/ru/application/ajax_create_application/{ann}"),
+        ("GET", f"/ru/application/lots/{ann}"),
+        ("POST", f"/ru/application/ajax_add_lots/{ann}/{app}"),
+        ("POST", f"/ru/application/ajax_lots_next/{ann}/{app}"),
+    ]
+    requests = [req for req in result["log"] if (req["m"], req["path"]) in stage]
+    assert [(req["m"], req["path"]) for req in requests] == stage
+    assert all(previous["t1"] <= current["t0"] for previous, current in zip(requests, requests[1:]))
+    create, discover = requests[:2]
+    assert create["t1"] - create["t0"] == pytest.approx(2.625, abs=0.001)
+    assert discover["t1"] - discover["t0"] == pytest.approx(0.704, abs=0.001)
+    public = next(req for req in result["log"] if "/ajax_public_application/" in req["path"])
+    assert public["t1"] - public["t0"] == pytest.approx(2.438, abs=0.001)
+    assert result["from_open_s"] - result["to_public_request_s"] == pytest.approx(2.44, abs=0.01)
+
+
 def test_slow_tumar_start_does_not_delay_creation_and_uses_actual_version():
     result = _run({**FAST, "open_at": 0.0, "lag": 0.0, "tumar_warmup": 6.0,
                    "tumar_version": "1.2.3.4", "lp_cache": True})

@@ -147,6 +147,8 @@ class RunReports:
         publish_reports(self.repo, {path.name: path.read_bytes() for path in batch})
         for path in batch:
             path.unlink(missing_ok=True)
+        if batch:
+            log.info("bot.run_report_pushed", count=len(batch))
         return len(pending) <= _PUSH_BATCH_SIZE
 
     async def _send_document(self, bot, file: bytes, caption: str) -> bool:

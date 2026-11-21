@@ -9,12 +9,14 @@ pin that gate (goszakup/tumar.py::_popup_gate).
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from websockets.protocol import State
 
-from goszakup import tumar
+from goszakup import flow, tumar
 from goszakup.local_signer import KalkanSigner
 
 
@@ -38,6 +40,49 @@ async def test_idle_provider_reconnects_once_for_concurrent_bids(monkeypatch):
     await asyncio.gather(provider.ensure_connected(), provider.ensure_connected())
     assert provider.connected
     assert (closed, connected) == (1, 1)
+
+
+async def test_disconnected_provider_reconnects_while_price_page_loads(monkeypatch):
+    provider = tumar.TumarCSP(api_key="unused", autofill=lambda _: False)
+    provider.version = "1.0.0.0"
+    reconnect_started = asyncio.Event()
+    page_loaded = asyncio.Event()
+
+    async def connect():
+        reconnect_started.set()
+        await page_loaded.wait()
+        provider._ws = SimpleNamespace(state=State.OPEN)
+        provider.version = "2.0.0.0"
+
+    async def get_page(path):
+        assert path == "/ru/application/priceoffers/100/200"
+        await reconnect_started.wait()
+        page_loaded.set()
+        return ('<input id="public_key" value="KEY">'
+                '<input app_lot_id="300" buy_lot_point_id="400">')
+
+    async def get_encr_info(announce, app, *, lp_id, version):
+        assert page_loaded.is_set() and provider.connected
+        assert (announce, app, lp_id, version) == ("100", "200", 400, "2.0.0.0")
+        return {"plnSum": 100, "minPrice": 80, "salt": "fresh", "sign": "SIGN"}
+
+    monkeypatch.setattr(provider, "connect", AsyncMock(side_effect=connect))
+    monkeypatch.setattr(provider, "encrypt_offer_price", AsyncMock(
+        return_value=tumar.EncryptResult(encrypted_data="ENC", session_key="SESSION",
+                                        info="SN", sign="SIGN")))
+    client = SimpleNamespace(_get_page=get_page, get_encr_info=AsyncMock(side_effect=get_encr_info),
+                             add_encrypt=AsyncMock(), save_gamma_signs=AsyncMock(),
+                             priceoffers_next_gamma=AsyncMock())
+    signer = SimpleNamespace(sign_xml_batch=AsyncMock(return_value={400: "CMS"}))
+    params = flow.AtagosBidParams(announce_id="100", tender_lot_ids=[1], price=None, tumar=provider)
+
+    async with AsyncExitStack() as stack:
+        result = await asyncio.wait_for(flow._gamma_price(client, signer, params, "200", stack), 2)
+
+    assert result == ([400], {400: 80})
+    provider.connect.assert_awaited_once()
+    client.get_encr_info.assert_awaited_once()
+    assert client.add_encrypt.await_args.kwargs["salt"] == "fresh"
 
 
 async def test_cancelled_signing_drains_its_reply_before_the_next_command():

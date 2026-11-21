@@ -103,7 +103,7 @@ def progress_processor(logger, method_name, event_dict):
 _TRACE_SKIP = ("http.get", "http.post", "login.")
 _TRACE_EVENT = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)*")
 _TRACE_NUMBER_FIELDS = {
-    "attempt", "attempts", "strike", "level", "status", "len", "bytes", "body_len",
+    "attempt", "attempts", "strike", "level", "status", "len", "bytes", "body_len", "suffix_bytes",
     "n", "doc", "doc_id", "fid", "num", "pooled", "count", "accepted", "ok", "resumed",
     "pid", "dry_run", "parallel", "max_pending",
 }
@@ -188,7 +188,16 @@ _PUBLIC_EVENTS = {
     "http.response", *(f"operation.{kind}" for kind in _RUNTIME_OPERATIONS),
 }
 _PUBLIC_NUMBERS = _TRACE_DURATION_FIELDS | {
-    "bytes", "attempt", "accepted", "ok", "headers_s", "body_s", "tcp_s", "tls_s",
+    "bytes", "suffix_bytes", "attempt", "accepted", "ok", "headers_s", "body_s", "tcp_s", "tls_s",
+}
+_PUBLIC_DOC_TYPES = {"1253", "3327", "3328", "3334", "3335", "3359", "3715", "3730"}
+_PUBLIC_SPEC_PAGES = {str(page) for page in range(1, 11)}
+_PUBLIC_RANGE_VERDICTS = {
+    "status", "small_or_unknown_length", "encoded", "no_byte_ranges", "no_strong_etag", "eligible",
+}
+_PUBLIC_BID_JOURNAL = {
+    "flow.docs_next", "flow.docs_next.retry", "flow.docs_next.resaved",
+    "local_signer.range.eligibility", "local_signer.range.used",
 }
 _PUBLIC_PHASES = {
     "t0", "created", "lots_selected", "lots_done", "docs_signed", "docs_accepted",
@@ -210,7 +219,17 @@ _PUBLIC_RESULTS = {
 
 
 def _public_route(value: str) -> str:
-    return re.sub(r"/[0-9]+(?=/|$)", "", portal_trace_path(value))
+    route = portal_trace_path(value)
+    prefix, marker, suffix = route.partition("/application/show_doc/")
+    if marker:
+        segments = suffix.split("/")
+        if len(segments) >= 3 and (doc_type := segments[2]) in _PUBLIC_DOC_TYPES:
+            page = segments[4] if len(segments) == 5 else ""
+            path = prefix + marker + doc_type
+            if doc_type == "3334" and page in _PUBLIC_SPEC_PAGES:
+                path += "/" + page
+            return path
+    return re.sub(r"/[0-9]+(?=/|$)", "", route)
 
 
 def _public_http_status(status: str) -> str:
@@ -244,6 +263,11 @@ def _public_fields(event: str, fields: tuple[str, ...]) -> Iterator[str]:
             yield field
         elif name == "error_type" and value in {"dns", "other_poller", "conflict", "NetworkError"}:
             yield field
+        elif event == "local_signer.range.eligibility":
+            if name == "verdict" and value in _PUBLIC_RANGE_VERDICTS:
+                yield field
+            if name == "source" and value in {"enabled", "disabled"}:
+                yield field
 
 
 def public_bid_report(trace: BidTrace, result: str, scheduled_elapsed: float | None = None) -> str:
@@ -262,6 +286,10 @@ def public_bid_report(trace: BidTrace, result: str, scheduled_elapsed: float | N
         if http and not re.fullmatch(r"HTTP/[0-9.]{1,3}", http.version):
             http = http._replace(version="")
         public.events.append(event._replace(name=name, status=_public_http_status(event.status), http=http))
+    for elapsed, level, line in trace.logs:
+        event, _, fields = line.partition(" ")
+        if event in _PUBLIC_BID_JOURNAL:
+            public.logs.append((elapsed, level, " ".join([event, *_public_fields(event, tuple(fields.split()))])))
 
     title = _PUBLIC_RESULTS.get(result, _PUBLIC_RESULTS["failed"])
     if scheduled_elapsed is not None:

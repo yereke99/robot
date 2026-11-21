@@ -21,6 +21,25 @@ class GitSyncError(RuntimeError):
 REPORT_ROOT = "reports/windows"
 REPORT_NAME = re.compile(r"(?:bid|run)_[0-9]{8}T[0-9]{6}Z_[0-9a-f]{12}\.txt")
 _REMOTE_MAIN = "refs/remotes/origin/main"
+_PUSH_FAILURES = (
+    ("push_authentication_required", (
+        b"authentication failed", b"terminal prompts disabled", b"interactivity has been disabled",
+        b"invalid username or token", b"permission denied (publickey)", b"returned error: 401",
+    )),
+    ("push_branch_rejected", (b"gh006", b"gh013", b"protected branch", b"repository rule violations")),
+    ("push_access_denied", (b"write access to repository not granted", b"returned error: 403")),
+    ("push_network_failed", (b"could not resolve host", b"failed to connect", b"connection reset")),
+)
+
+
+def _push_failure(output: bytes) -> GitSyncError:
+    output = output.lower()
+    if any(reason in output for reason in (b"non-fast-forward", b"fetch first", b"failed to update ref")):
+        return GitSyncError("push_failed", remote_advanced=True)
+    for code, markers in _PUSH_FAILURES:
+        if any(marker in output for marker in markers):
+            return GitSyncError(code)
+    return GitSyncError("push_failed")
 
 
 def _windows_git() -> str:
@@ -81,11 +100,9 @@ def _git(
     except OSError:
         raise GitSyncError("git_unavailable") from None
     if result.returncode:
-        output = result.stdout + result.stderr
-        retry = args[0] == "push" and any(
-            reason in output for reason in (b"non-fast-forward", b"fetch first", b"failed to update ref")
-        )
-        raise GitSyncError(f"{args[0]}_failed", remote_advanced=retry)
+        if args[0] == "push":
+            raise _push_failure(result.stdout + b"\n" + result.stderr)
+        raise GitSyncError(f"{args[0]}_failed")
     return result.stdout.decode("utf-8", errors="replace").strip()
 
 

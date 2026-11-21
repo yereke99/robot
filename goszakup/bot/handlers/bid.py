@@ -88,7 +88,7 @@ async def deliver_timing_report(
         text = trace.render(title=title)
         stamp = time.strftime("%Y%m%d_%H%M%S")
         if git_name:
-            text = f"Имя файла в GitHub {git_name}\n\n{text}"
+            text = f"Имя файла для GitHub {git_name}\n\n{text}"
             stamp += "_" + git_name.rsplit("_", 1)[-1].removesuffix(".txt")
         name = f"timing_{announce_id}_{stamp}.txt"
         _LAST_REPORT[chat_id] = (name, text)

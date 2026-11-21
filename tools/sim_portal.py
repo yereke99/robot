@@ -63,6 +63,9 @@ class Portal:
         self.loop = loop
         self.G = cfg.get("G", 1.6)                 # page GET latency
         self.P = cfg.get("P", 0.7)                 # ajax POST latency
+        self.create_post = cfg.get("create_post", self.P)
+        self.create_status_only = cfg.get("create_status_only", False)
+        self.lots_discovery_get = cfg.get("lots_discovery_get", self.G)
         self.public_delay = cfg.get("public_delay", self.P)
         self.docs_get = cfg.get("docs_get", self.G)
         self.tumar_version = cfg.get("tumar_version", "1.0.13.2285")
@@ -261,16 +264,29 @@ class Portal:
                 if self.now() < self.open_at:
                     self.bad("create before open")
                     return httpx.Response(200, json={"status": "error", "message": "не открыт"})
-                if self.app_created:
+                if self.t_create_post is not None:
                     self.bad("DUPLICATE create_application")
-                if self.t_create_post is None:
+                else:
                     self.t_create_post = self.now()
 
                 def commit():
                     self.app_created = True
                     self.stage = "lots"
-                return httpx.Response(200, json={"status": "ok", "application_id": APP}), commit
-            return await self.serve(request, P, build)
+                body = {"status": "ok"}
+                if not self.create_status_only:
+                    body["application_id"] = APP
+                return httpx.Response(200, json=body), commit
+            return await self.serve(request, self.create_post, build)
+
+        @r.get(url__regex=rf".*/ru/application/lots/{ANN}$")
+        async def discover_application(request):
+            def build():
+                if not self.app_created:
+                    self.bad("application ID discovery before create committed")
+                    return httpx.Response(404, html="draft not found")
+                page = f'<a href="/ru/application/lots/{ANN}/{APP}">Лоты заявки</a>' + PAD
+                return httpx.Response(200, html=page)
+            return await self.serve(request, self.lots_discovery_get, build)
 
         @r.post(url__regex=rf".*/ajax_add_lots/{ANN}/{APP}$")
         async def add_lots(request):

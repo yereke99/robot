@@ -1756,6 +1756,13 @@ async def _open_tumar(params, stack):
 async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None):
     """Encrypt and sign each price for the current application."""
     ann = params.announce_id
+    tumar = params.tumar
+    reconnect_task = None
+    if isinstance(tumar, TumarCSP) and not tumar.connected:
+        # The local handshake can run alongside the portal's price-page read.
+        reconnect_task = asyncio.create_task(tumar.ensure_connected())
+        stack.push_async_callback(_cancel_task, reconnect_task)
+
     price_path = f"/ru/application/priceoffers/{ann}/{app_id}"
     try:
         po_html = await gz._get_page(price_path)
@@ -1795,8 +1802,7 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None):
     t_gamma0 = time.time()
 
     # TumarCSP: injected (bot) > pre-warmed during docs > opened now.
-    if params.tumar is not None:
-        tumar = params.tumar
+    if tumar is not None:
         if getattr(tumar, "_autofill", None) is None:
             from .popup_filler import is_supported, make_autofiller
             if is_supported():
@@ -1816,6 +1822,8 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None):
     else:
         tumar = await _open_tumar(params, stack)
     if isinstance(tumar, TumarCSP):
+        if reconnect_task is not None:
+            await reconnect_task
         await tumar.ensure_connected()
 
     # Fallback source of pl_sum if ajax_get_encr_info doesn't carry it: the

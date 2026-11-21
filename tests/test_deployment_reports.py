@@ -98,6 +98,22 @@ def test_publish_retries_on_a_simultaneous_main_update(git_repos, monkeypatch):
     assert git(remote, "show", f"main:reports/windows/{FILENAME}") == PAYLOAD.decode().strip()
 
 
+@pytest.mark.parametrize(("diagnostic", "code"), [
+    (b"fatal: could not read Username: terminal prompts disabled", "push_authentication_required"),
+    (b"remote: Write access to repository not granted.", "push_access_denied"),
+    (b"remote: error: GH013: Repository rule violations", "push_branch_rejected"),
+    (b"fatal: Could not resolve host: github.com", "push_network_failed"),
+])
+def test_push_errors_report_only_a_safe_cause(tmp_path, monkeypatch, diagnostic, code):
+    rejected = subprocess.CompletedProcess(["git", "push"], 1, b"", diagnostic + b"\nsecret=value")
+    monkeypatch.setattr(git_sync.subprocess, "run", Mock(return_value=rejected))
+    monkeypatch.setattr(git_sync, "_windows_git", lambda: "git.exe")
+    with pytest.raises(git_sync.GitSyncError) as exc:
+        git_sync._git(tmp_path, "push", "origin", "main")
+    assert str(exc.value) == code
+    assert not exc.value.remote_advanced
+
+
 def test_strict_update_accepts_origin_and_rejects_local_changes(git_repos):
     repo, remote = git_repos
     git_sync.publish_reports(repo, {FILENAME: PAYLOAD})
@@ -288,7 +304,12 @@ async def test_bid_reports_survive_a_failed_push_and_restart(git_repos, tmp_path
     trace.marks = [(0.0, "t0"), (16.0, "public_start"), (17.6, "public_done")]
     trace.events.append((16.0, 1.6, "POST",
                          f"/ru/application/ajax_public_application/{TENDER}/{APPLICATION}", "200/secret"))
+    trace.events.append((9.2, 1.7, "POST",
+                         f"/ru/application/show_doc/{TENDER}/{APPLICATION}/3334/77665544/2", "200"))
     trace.log("warning", "do not publish these raw notes")
+    trace.logs.append((10.4, "info",
+                       "local_signer.range.eligibility bytes=5646499 verdict=no_byte_ranges "
+                       f"source=disabled fid={DOCUMENT} token=secret"))
     first = await reports.save_bid(trace, "public_ok")
     second = await reports.save_bid(trace, "public_error")
     assert first != second
@@ -307,7 +328,9 @@ async def test_bid_reports_survive_a_failed_push_and_restart(git_repos, tmp_path
     assert "Заявка подана" in one and "17.60 с" in one
     assert "Портал отклонил заявку" in two
     assert "ajax_public_application" in one and "1.60 с" in one
-    assert all(value not in one for value in (TENDER, APPLICATION, "secret", "raw notes"))
+    assert "/ru/application/show_doc/3334/2" in one
+    assert "bytes=5646499 verdict=no_byte_ranges source=disabled" in one
+    assert all(value not in one for value in (TENDER, APPLICATION, DOCUMENT, "77665544", "secret", "raw notes"))
 
 
 async def test_managed_bid_automatically_sends_timing_only_to_owner(tmp_path, monkeypatch):
