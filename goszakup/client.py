@@ -37,6 +37,7 @@ import asyncio
 import re
 import ssl
 import time
+from dataclasses import dataclass
 from typing import Callable, Mapping, Optional, Sequence
 from urllib.parse import urlencode
 
@@ -91,6 +92,12 @@ class AlreadyPrepared(RuntimeError):
         self.app_id = app_id
 
 
+@dataclass(frozen=True, repr=False)
+class FetchedPricePage:
+    html: str
+    cookies: tuple[str | None, str | None]
+
+
 class AlreadyAtPriceStage(RuntimeError):
     """The draft already advanced to the price-offer (priceoffers) stage.
 
@@ -103,9 +110,12 @@ class AlreadyAtPriceStage(RuntimeError):
     the priceoffers page and doesn't need the tender_lot→app_lot mapping).
     """
 
-    def __init__(self, message: str, *, app_id: Optional[str] = None):
+    def __init__(
+        self, message: str, *, app_id: Optional[str] = None, fetched_page: FetchedPricePage | None = None,
+    ):
         super().__init__(message)
         self.app_id = app_id
+        self.fetched_page = fetched_page
 
 
 class LotDocumentSaveUnconfirmed(RuntimeError):
@@ -531,6 +541,10 @@ class GoszakupClient:
         application moves to the next stage, the previous URL 302s to the
         current one (e.g., /application/create/{ann} → /application/docs/{ann}/{app_id}).
         """
+        return (await self._get_page_response(path, follow_redirects=follow_redirects)).text
+
+    async def _get_page_response(self, path: str, *, follow_redirects: bool = True) -> httpx.Response:
+        """Fetch an HTML page and retain its final URL."""
         log.info("http.get", path=path)
         r = await self._http.get(path, follow_redirects=follow_redirects)
         final_url = str(r.url)
@@ -544,7 +558,7 @@ class GoszakupClient:
         if "/user/login" in final_url:
             raise SessionExpired(f"GET {path} -> {final_url}")
         r.raise_for_status()
-        return r.text
+        return r
 
     # ---------- step 1-3: create + lots ----------
 

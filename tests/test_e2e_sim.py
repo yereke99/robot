@@ -88,10 +88,27 @@ def test_lot_documents_start_while_docs_list_is_loading():
     docs = next(req for req in requests if "/application/docs/" in req["path"])
     mapping = next(req for req in requests if req["path"].endswith("/3334"))
     spec = next(req for req in requests if "/3334/85000001/1" in req["path"])
+    create = next(req for req in requests if "/ajax_create_application/" in req["path"])
+    lots = next(req for req in requests if "/ajax_lots_next/" in req["path"])
+    attach = next(req for req in requests if "/beneficiary/ajax_save_info" in req["path"])
     beneficiary_checks = [req for req in requests if req["path"] == "/files/check_status/"]
     assert mapping["t1"] <= spec["t0"] < docs["t1"]
     assert len(beneficiary_checks) == 1
-    assert beneficiary_checks[0]["t0"] < mapping["t1"]
+    assert beneficiary_checks[0]["t0"] < create["t1"]
+    assert lots["t1"] <= attach["t0"]
+
+
+def test_beneficiary_file_is_rechecked_if_creation_rotates_the_session():
+    result = _run({**FAST, "rotate_session_on_create": True, "want_log": True})
+    _assert_submitted(result)
+
+    requests = result["log"]
+    create = next(req for req in requests if "/ajax_create_application/" in req["path"])
+    lots = next(req for req in requests if "/ajax_lots_next/" in req["path"])
+    attach = next(req for req in requests if "/beneficiary/ajax_save_info" in req["path"])
+    precheck, recheck = [req for req in requests if req["path"] == "/files/check_status/"]
+    assert precheck["t0"] < create["t1"] <= lots["t1"] <= recheck["t0"]
+    assert recheck["t1"] <= attach["t0"]
 
 
 def test_lost_agreement_response_continues_using_the_generated_file():

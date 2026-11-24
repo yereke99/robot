@@ -65,6 +65,7 @@ class Portal:
         self.P = cfg.get("P", 0.7)                 # ajax POST latency
         self.create_post = cfg.get("create_post", self.P)
         self.create_status_only = cfg.get("create_status_only", False)
+        self.rotate_session_on_create = cfg.get("rotate_session_on_create", False)
         self.lots_discovery_get = cfg.get("lots_discovery_get", self.G)
         self.public_delay = cfg.get("public_delay", self.P)
         self.docs_get = cfg.get("docs_get", self.G)
@@ -298,7 +299,8 @@ class Portal:
                 body = {"status": "ok"}
                 if not self.create_status_only:
                     body["application_id"] = APP
-                return httpx.Response(200, json=body), commit
+                headers = {"Set-Cookie": "ci_session=after-create; Path=/"} if self.rotate_session_on_create else {}
+                return httpx.Response(200, json=body, headers=headers), commit
             return await self.serve(request, self.create_post, build)
 
         @r.get(url__regex=rf".*/ru/application/lots/{ANN}$")
@@ -507,6 +509,9 @@ class Portal:
 
         @r.post(url__regex=r".*/files/check_status/$")
         async def check_status(request):
+            if self.rotate_session_on_create and self.app_created:
+                if "ci_session=after-create" not in request.headers.get("cookie", ""):
+                    self.bad("beneficiary file checked against the old session after create")
             return await self.serve(request, P, lambda: httpx.Response(200, json={"status": 1}))
 
         @r.post(url__regex=r".*/ru/beneficiary/ajax_save_info$")

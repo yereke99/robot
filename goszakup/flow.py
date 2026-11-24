@@ -39,7 +39,7 @@ from typing import Awaitable, Callable, Optional, Sequence
 import httpx
 import structlog
 
-from .client import AlreadyAtPriceStage, AlreadyPrepared, GoszakupClient, SessionExpired
+from .client import AlreadyAtPriceStage, AlreadyPrepared, FetchedPricePage, GoszakupClient, SessionExpired
 from .local_signer import KalkanSigner, LocalSigner
 from .parser import _dump, extract_download_targets, extract_prepared_doc_target
 from .pipeline import _extract_app_lot_mapping  # reuse temka's robust mapper
@@ -278,6 +278,23 @@ def _clone_session(gz):
     sib = gz.clone_unauthenticated()
     _sync_session(gz, sib)
     return sib
+
+
+async def _precheck_beneficiary_file(gz: GoszakupClient, file_id: int) -> str | None:
+    """Check a previously uploaded file without touching the live cookie jar."""
+    try:
+        async with asyncio.timeout(4.0):
+            async with _clone_session(gz) as sibling:
+                session = sibling.get_cookie("ci_session")
+                if not session:
+                    return None
+                response = await sibling.check_file_status([file_id])
+                if (response.is_success and isinstance(response.json(), (dict, list))
+                        and sibling.get_cookie("ci_session") == session):
+                    return session
+    except (httpx.HTTPError, OSError, SessionExpired, TimeoutError, ValueError) as exc:
+        log.info("flow.beneficiary.early_check_miss", error_type=type(exc).__name__)
+    return None
 
 
 @dataclass
@@ -810,6 +827,7 @@ async def submit_bid(
         early_futures: dict = {}
         skip_docs = False
         app_lot_map: dict = {}
+        fetched_price_page = None
         if params.resume_app_id:
             app_id = str(params.resume_app_id)
             state.application_id = app_id
@@ -819,6 +837,15 @@ async def submit_bid(
             log.info("flow.resume_app_id", app_id=app_id,
                      reason="skip create/lots/docs → gamma+submit")
         else:
+            file_check = None
+            beneficiary_file_id = str(getattr(beneficiary, "id_file_id", "") or "")
+            if (doc_pool and isinstance(gz, GoszakupClient) and gz.get_cookie("ci_session")
+                    and beneficiary_file_id.isascii() and beneficiary_file_id.isdecimal()
+                    and any(spec.kind == "beneficiary" for spec in params.doc_plan)):
+                file_check = asyncio.create_task(_precheck_beneficiary_file(gz, int(beneficiary_file_id)))
+                stack.push_async_callback(_cancel_task, file_check)
+                log.info("flow.beneficiary.early_check_started")
+
             # === create / lots ===
             app_id = await gz.create_application(
                 params.announce_id,
@@ -886,11 +913,20 @@ async def submit_bid(
                 if spec.kind == "beneficiary" and beneficiary.id_file_id:
                     # This check needs only the existing file ID. The attachment
                     # still waits for the application's lot IDs.
-                    try:
-                        checked = await sib.check_file_status([int(beneficiary.id_file_id)])
-                        checked_beneficiary_file = checked.is_success
-                    except Exception as e:  # retry in the normal document flow
-                        log.warning("flow.beneficiary.check_prefetch_failed", err=str(e)[:120])
+                    if file_check is not None:
+                        checked_session = await asyncio.shield(file_check)
+                        checked_beneficiary_file = bool(
+                            checked_session
+                            and checked_session == sib.get_cookie("ci_session") == gz.get_cookie("ci_session")
+                        )
+                    if checked_beneficiary_file:
+                        log.info("flow.beneficiary.early_check_used")
+                    else:
+                        try:
+                            checked = await sib.check_file_status([int(beneficiary.id_file_id)])
+                            checked_beneficiary_file = checked.is_success
+                        except Exception as e:  # retry in the normal document flow
+                            log.warning("flow.beneficiary.check_prefetch_failed", err=str(e)[:120])
                 if spec.doc_id in _AGREEMENT_DOC_IDS:
                     # only this doc depends on the docs page (its id may be remapped)
                     await asyncio.shield(docs_page_task)
@@ -925,13 +961,14 @@ async def submit_bid(
                          len=len(reply_text))
                 # the plan (agreement id) must be final before the doc phase reads it
                 await asyncio.shield(docs_page_task)
-            except AlreadyAtPriceStage:
+            except AlreadyAtPriceStage as exc:
                 # Draft already at the price stage (docs done on a prior run) — skip
                 # the whole doc phase and resume at the gamma price. Cancel any early
                 # docs that started before discovery (they'd fail on the advanced draft).
                 log.warning("flow.resume_at_price", app_id=app_id,
                             reason="draft already at /priceoffers/; skipping doc phase")
                 skip_docs = True
+                fetched_price_page = exc.fetched_page if exc.app_id == app_id else None
                 app_lot_map = {}
                 pending_docs = [*early_futures.values(), docs_page_task]
                 for task in pending_docs:
@@ -982,6 +1019,7 @@ async def submit_bid(
             gz, ns, params, app_id, stack, tumar_task=tumar_task,
             warm_reconnect_task=warm_reconnect_task,
             cached_lp_id=cached_lp_id,
+            fetched_price_page=fetched_price_page,
         )
         _mark(state, "gamma_done")
         if lp_id_cache is not None and price_cache_key is not None:
@@ -1144,17 +1182,24 @@ async def _discover_app_lots(gz, params, app_id, *, docs_page_task=None) -> dict
     html_text = ""
     for cand in candidates:
         html_text = None
+        response = None
         if cand == docs_path and docs_page_task is not None:
             html_text = await asyncio.shield(docs_page_task)
         if html_text is None:
-            html_text = await gz._get_page(cand)
+            if isinstance(gz, GoszakupClient):
+                response = await gz._get_page_response(cand)
+                html_text = response.text
+            else:
+                html_text = await gz._get_page(cand)
         # A redirect to an already-advanced draft skips discovery. Stage markers
         # are explicit, unlike links to preview/priceoffers on other pages.
         if 'current_method = "preview"' in html_text:
             raise AlreadyPrepared(f"draft {app_id} already at /preview/ stage", app_id=app_id)
         if 'current_method = "priceoffers"' in html_text:
+            fetched_page = _verified_price_page(gz, response, ann, app_id) if response is not None else None
             raise AlreadyAtPriceStage(
-                f"draft {app_id} already at /priceoffers/ stage", app_id=app_id
+                f"draft {app_id} already at /priceoffers/ stage",
+                app_id=app_id, fetched_page=fetched_page,
             )
         got = _extract_app_lot_mapping(html_text, params.tender_lot_ids)
         if got:
@@ -2024,6 +2069,26 @@ def _price_session_cookies(gz) -> tuple[str | None, str | None]:
     return gz.get_cookie("ci_session"), gz.get_cookie("csrf_cookie")
 
 
+def _price_page_public_key(html: str) -> str | None:
+    match = re.search(r'id=["\']public_key["\'][^>]*\bvalue=["\']([^"\']+)["\']', html)
+    return match.group(1) if match else None
+
+
+def _verified_price_page(gz, response: httpx.Response, ann: str, app_id: str) -> FetchedPricePage | None:
+    url = response.url
+    origin = httpx.URL(gz.base_url)
+    price_path = f"/application/priceoffers/{ann}/{app_id}"
+    if (response.status_code != 200 or url.query
+            or (url.scheme, url.host, url.port) != (origin.scheme, origin.host, origin.port)
+            or url.path.removesuffix("/") not in (f"/ru{price_path}", f"/kz{price_path}")):
+        return None
+    cookies = _price_session_cookies(gz)
+    html = response.text
+    if not cookies[0] or not _price_page_public_key(html) or not _extract_gamma_pairs(html):
+        return None
+    return FetchedPricePage(html, cookies)
+
+
 async def _prefetch_encr_info(gz, ann, app_id, lp_id, version, cookies) -> dict | None:
     """Fetch one candidate on a separate jar so a rejection cannot replace the live session."""
     try:
@@ -2049,7 +2114,8 @@ async def _prefetch_encr_info(gz, ann, app_id, lp_id, version, cookies) -> dict 
 
 
 async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None,
-                       warm_reconnect_task=None, cached_lp_id: int | None = None):
+                       warm_reconnect_task=None, cached_lp_id: int | None = None,
+                       fetched_price_page: FetchedPricePage | None = None):
     """Encrypt and sign each price for the current application."""
     ann = params.announce_id
     tumar = params.tumar
@@ -2079,13 +2145,17 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None,
             log.info("flow.gamma.encr_info_prefetch", lp_id=cached_lp_id)
 
     price_path = f"/ru/application/priceoffers/{ann}/{app_id}"
-    try:
-        po_html = await gz._get_page(price_path)
-    except (httpx.TransportError, httpx.HTTPStatusError) as exc:
-        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500:
-            raise
-        log.warning("flow.priceoffers.fetch_retry", detail=type(exc).__name__)
-        po_html = await gz._get_page(price_path)
+    if fetched_price_page is not None and _price_session_cookies(gz) == fetched_price_page.cookies:
+        po_html = fetched_price_page.html
+        log.info("flow.priceoffers.reused_on_resume", app_id=app_id)
+    else:
+        try:
+            po_html = await gz._get_page(price_path)
+        except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500:
+                raise
+            log.warning("flow.priceoffers.fetch_retry", detail=type(exc).__name__)
+            po_html = await gz._get_page(price_path)
     # Bring-up only: the inline <script> shows how get_encr_info maps to the
     # TumarCSP Param. Off the hot path now (set ATAGOS_DEBUG_DUMPS=1 to re-enable).
     if os.environ.get("ATAGOS_DEBUG_DUMPS"):
@@ -2156,8 +2226,7 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None,
 
     # public_key (the per-tender EFC cert) lives in a hidden input on the price
     # page — ajax_get_encr_info doesn't return it, but EncryptOfferPrice needs it.
-    pkm = re.search(r'id=["\']public_key["\'][^>]*\bvalue=["\']([^"\']+)["\']', po_html)
-    page_public_key = pkm.group(1) if pkm else None
+    page_public_key = _price_page_public_key(po_html)
     if not page_public_key:
         log.warning("flow.gamma.no_public_key_on_page", ann=ann)
 
