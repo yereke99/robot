@@ -659,7 +659,7 @@ async def submit_bid(
     *,
     params: AtagosBidParams,
     ci_session: str,
-    lp_id_cache: dict | None = None,    # optional output: announce_id -> [lp_id]
+    lp_id_cache: dict | None = None,    # exact announce and selected lot set -> [lp_id]
     reuse_doc_pool: list | None = None, # готовые сессии из прошлой ставки
     tz_sig_cache: dict | None = None,   # sha256 -> gost_sig для ТЗ файлов
     company: dict,
@@ -969,14 +969,26 @@ async def submit_bid(
             state_store.save(state)
             return state
 
+        price_cache_key = None
+        cached_lp_id = None
+        if lp_id_cache is not None and "docs_accepted" in state.timestamps:
+            price_cache_key = _single_lot_price_cache_key(params.announce_id, params.tender_lot_ids)
+            cached_points = lp_id_cache.get(price_cache_key) if price_cache_key is not None else None
+            if (isinstance(cached_points, list) and len(cached_points) == 1
+                    and type(cached_points[0]) is int and cached_points[0] > 0):
+                cached_lp_id = cached_points[0]
         _mark(state, "gamma_start")
         discovered_lp_ids, prices_by_lp = await _gamma_price(
             gz, ns, params, app_id, stack, tumar_task=tumar_task,
             warm_reconnect_task=warm_reconnect_task,
+            cached_lp_id=cached_lp_id,
         )
         _mark(state, "gamma_done")
-        if lp_id_cache is not None and discovered_lp_ids:
-            lp_id_cache[params.announce_id] = discovered_lp_ids
+        if lp_id_cache is not None and price_cache_key is not None:
+            if len(discovered_lp_ids) == 1:
+                lp_id_cache[price_cache_key] = discovered_lp_ids
+            else:
+                lp_id_cache.pop(price_cache_key, None)
         state.step = "signed"
         _mark(state, "signed")
         state_store.save(state)
@@ -2001,7 +2013,43 @@ async def _open_tumar(params, stack):
     )
 
 
-async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None, warm_reconnect_task=None):
+def _single_lot_price_cache_key(announce_id: str, lot_ids: Sequence[int]) -> str | None:
+    selected = set(lot_ids)
+    if len(selected) != 1:
+        return None
+    return f"{announce_id}:{selected.pop()}"
+
+
+def _price_session_cookies(gz) -> tuple[str | None, str | None]:
+    return gz.get_cookie("ci_session"), gz.get_cookie("csrf_cookie")
+
+
+async def _prefetch_encr_info(gz, ann, app_id, lp_id, version, cookies) -> dict | None:
+    """Fetch one candidate on a separate jar so a rejection cannot replace the live session."""
+    try:
+        async with _clone_session(gz) as sibling:
+            if _price_session_cookies(sibling) != cookies:
+                return None
+            raw = await sibling.get_encr_info(ann, app_id, lp_id=lp_id, version=version)
+            if _price_session_cookies(sibling) != cookies:
+                return None
+    except (httpx.HTTPError, OSError, RuntimeError) as exc:
+        log.info("flow.gamma.encr_info_prefetch_failed", error_type=type(exc).__name__)
+        return None
+    if not _is_valid_encr_info(raw) or raw.get("error") or raw.get("errors"):
+        return None
+    offer_id = (raw.get("id_priceoffer") or raw.get("idPriceoffer")
+                or str(raw.get("info") or "").partition(";")[0].strip())
+    if not re.fullmatch(rf"\d+_{lp_id}", str(offer_id)):
+        return None
+    salt, signature = raw.get("salt"), raw.get("sign") or raw.get("signature")
+    if not all(isinstance(value, str) and value.strip() for value in (salt, signature)):
+        return None
+    return raw
+
+
+async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None,
+                       warm_reconnect_task=None, cached_lp_id: int | None = None):
     """Encrypt and sign each price for the current application."""
     ann = params.announce_id
     tumar = params.tumar
@@ -2010,6 +2058,25 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None, warm_r
         # The local handshake can run alongside the portal's price-page read.
         reconnect_task = asyncio.create_task(tumar.ensure_connected())
         stack.push_async_callback(_cancel_task, reconnect_task)
+
+    prefetched = None
+    prefetch_version = None
+    prefetch_cookies = None
+    candidate_provider = tumar
+    if (candidate_provider is None and tumar_task is not None and tumar_task.done()
+            and not tumar_task.cancelled() and tumar_task.exception() is None):
+        candidate_provider = tumar_task.result()
+    if (cached_lp_id is not None and isinstance(gz, GoszakupClient)
+            and isinstance(candidate_provider, TumarCSP)
+            and candidate_provider.connected and candidate_provider.version):
+        prefetch_cookies = _price_session_cookies(gz)
+        if prefetch_cookies[0]:
+            prefetch_version = candidate_provider.version
+            prefetched = asyncio.create_task(
+                _prefetch_encr_info(gz, ann, app_id, cached_lp_id, prefetch_version, prefetch_cookies)
+            )
+            stack.push_async_callback(_cancel_task, prefetched)
+            log.info("flow.gamma.encr_info_prefetch", lp_id=cached_lp_id)
 
     price_path = f"/ru/application/priceoffers/{ann}/{app_id}"
     try:
@@ -2047,6 +2114,10 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None, warm_r
         )
     log.info("flow.gamma.pairs", pairs=pairs)
     discovered_lp_ids = [lp_id for (_, lp_id) in pairs]
+    if prefetched is not None and cached_lp_id not in discovered_lp_ids:
+        await _cancel_task(prefetched)
+        prefetched = None
+        log.info("flow.gamma.encr_info_prefetch_miss", lp_id=cached_lp_id)
     t_gamma0 = time.time()
 
     # TumarCSP: injected (bot) > pre-warmed during docs > opened now.
@@ -2090,7 +2161,36 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None, warm_r
     if not page_public_key:
         log.warning("flow.gamma.no_public_key_on_page", ann=ann)
 
-    async def _fetch_encr_info(lp_id: int) -> dict:
+    def _parse_info(raw, lp_id):
+        return _parse_encr_info(
+            raw, lp_id,
+            override_price=params.price,
+            floor_ratio=params.dumping_floor_ratio,
+            planned_price_ratio=params.planned_price_ratio,
+            page_pl_sum=page_pl.get(lp_id, 0.0),
+            page_public_key=page_public_key,
+        )
+
+    async def _fetch_encr_info(lp_id: int) -> tuple[dict, EncrInfo | None]:
+        if prefetched is not None and lp_id == cached_lp_id:
+            # An earlier request can replace the portal salt. Let it finish
+            # before making another request for the same point.
+            candidate = await prefetched
+            if isinstance(tumar, TumarCSP) and not tumar.connected:
+                await tumar.ensure_connected()
+            if (candidate is not None and discovered_lp_ids == [lp_id]
+                    and tumar.version == prefetch_version
+                    and _price_session_cookies(gz) == prefetch_cookies):
+                try:
+                    parsed = _parse_info(candidate, lp_id)
+                except (ArithmeticError, ValueError, RuntimeError):
+                    pass
+                else:
+                    if (parsed.public_key and (not page_public_key or parsed.public_key == page_public_key)
+                            and 0 < parsed.d_sum <= parsed.pl_sum):
+                        log.info("flow.gamma.encr_info_prefetch_hit", lp_id=lp_id)
+                        return candidate, parsed
+            log.info("flow.gamma.encr_info_prefetch_miss", lp_id=lp_id)
         version = tumar.version or "1.0.13.2285"
         raw = await gz.get_encr_info(ann, app_id, lp_id=lp_id, version=version)
         if not _is_valid_encr_info(raw):
@@ -2098,7 +2198,7 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None, warm_r
             await asyncio.sleep(0.5)
             trace_event("wait", "Повтор получения параметров шифрования", started)
             raw = await gz.get_encr_info(ann, app_id, lp_id=lp_id, version=version)
-        return raw
+        return raw, None
 
     encrypted_by_pair: dict[tuple[int, int], str] = {}
     prices_by_lp: dict[int, float] = {}
@@ -2115,16 +2215,9 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None, warm_r
             encr_info[lp_id] = task
 
         for idx, (app_lot, lp_id) in enumerate(pairs):
-            raw = await encr_info[lp_id]
+            raw, parsed = await encr_info[lp_id]
             log.info("flow.get_encr_info.received", lp_id=lp_id, keys=sorted(raw))
-            info = _parse_encr_info(
-                raw, lp_id,
-                override_price=params.price,
-                floor_ratio=params.dumping_floor_ratio,
-                planned_price_ratio=params.planned_price_ratio,
-                page_pl_sum=page_pl.get(lp_id, 0.0),
-                page_public_key=page_public_key,
-            )
+            info = parsed if parsed is not None else _parse_info(raw, lp_id)
             prices_by_lp[lp_id] = info.bidding_price
             enc = await tumar.encrypt_offer_price(info)
             encrypted_by_pair[(app_lot, lp_id)] = enc.encrypted_data

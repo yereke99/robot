@@ -25,11 +25,12 @@ import re
 import shlex
 import subprocess
 import time
-from contextlib import aclosing
+from contextlib import aclosing, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
+from weakref import WeakValueDictionary
 
 import httpx
 import structlog
@@ -311,6 +312,9 @@ class LocalSigner:
             self._owns_kalkan = True
         self._http = http_client
         self._range_tasks: set[asyncio.Task] = set()
+        self._immutable_signature_locks: WeakValueDictionary[tuple[int, str], asyncio.Lock] = (
+            WeakValueDictionary()
+        )
 
     async def __aenter__(self) -> "LocalSigner":
         if self._owns_kalkan:
@@ -489,22 +493,34 @@ class LocalSigner:
         file_path = re.fullmatch(r"/files/download_file/(\d+)(?:/\d+)?/", source.path)
         immutable = bool(not (source.scheme or source.netloc or source.query) and file_path
                          and cache_key == f"fid:{file_path[1]}")
-        log.info("local_signer.fetch", url=url)
-        data = await self._download_file(url, headers, immutable)
-        log.info("local_signer.fetch.done", bytes=len(data))
-        content_hash = hashlib.sha256(data).hexdigest()
-        content_key = f"{ns_prefix}{content_hash}"
-        if sig_cache is not None and content_key in sig_cache:
-            log.info("local_signer.sig_cache.hit", url=url, sha256=content_hash[:16])
-            sig = sig_cache[content_key]
-        else:
-            sig = await self._kalkan.sign_bytes(data)
-            if sig_cache is not None:
-                sig_cache[content_key] = sig
-                log.info("local_signer.sig_cache.stored", url=url, sha256=content_hash[:16])
-        if sig_cache is not None and fast_key:
-            sig_cache[fast_key] = sig
-        return sig
+
+        guard = nullcontext()
+        if immutable and sig_cache is not None and fast_key:
+            # The existing signature cache becomes visible to every waiter
+            # after the first caller finishes. The guard lives only as long as
+            # there are active calls for this cache and file ID.
+            guard = self._immutable_signature_locks.setdefault((id(sig_cache), fast_key), asyncio.Lock())
+
+        async with guard:
+            if sig_cache is not None and fast_key and fast_key in sig_cache:
+                log.info("local_signer.sig_cache.hit_no_download", key=cache_key)
+                return sig_cache[fast_key]
+            log.info("local_signer.fetch", url=url)
+            data = await self._download_file(url, headers, immutable)
+            log.info("local_signer.fetch.done", bytes=len(data))
+            content_hash = hashlib.sha256(data).hexdigest()
+            content_key = f"{ns_prefix}{content_hash}"
+            if sig_cache is not None and content_key in sig_cache:
+                log.info("local_signer.sig_cache.hit", url=url, sha256=content_hash[:16])
+                sig = sig_cache[content_key]
+            else:
+                sig = await self._kalkan.sign_bytes(data)
+                if sig_cache is not None:
+                    sig_cache[content_key] = sig
+                    log.info("local_signer.sig_cache.stored", url=url, sha256=content_hash[:16])
+            if sig_cache is not None and fast_key:
+                sig_cache[fast_key] = sig
+            return sig
 
     async def sign_xml_batch(self, items, *, retries: int = 1) -> dict[str, str]:
         """Mirror of ``NursignClient.sign_xml_batch``.

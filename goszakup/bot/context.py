@@ -85,9 +85,9 @@ class BotContext:
     # Ключ: sha256_hex, значение: gost_sig_b64
     tz_sig_cache: dict = field(default_factory=dict)
 
-    # lp_id кэш: announce_id -> [lp_id, ...] (из прошлых ставок на тот же тендер)
-    # lp_id — это ID лотовой точки (tender-specific, не меняется между ставками).
-    # Зная его заранее, можно запустить encr_info во время docs phase → -2.5с.
+    # Для заявки с одним лотом: "announce_id:lot_id" -> [lp_id].
+    # После принятия документов это подсказка для параллельного запроса
+    # параметров текущей заявки. Страница цены подтверждает точку заново.
     lp_id_cache: dict[str, list[int]] = field(default_factory=dict)
 
     # doc_pool кэш: переиспользуем залогиненные сессии между ставками.

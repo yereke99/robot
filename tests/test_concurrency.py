@@ -12,12 +12,15 @@ import asyncio
 from contextlib import AsyncExitStack
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
+import respx
 from websockets.protocol import State
 
 from goszakup import flow, tumar
+from goszakup.client import GoszakupClient
 from goszakup.local_signer import KalkanSigner
 from goszakup.state import StateStore
 
@@ -87,6 +90,94 @@ async def test_disconnected_provider_reconnects_while_price_page_loads(monkeypat
     assert client.add_encrypt.await_args.kwargs["salt"] == "fresh"
 
 
+@pytest.mark.parametrize("candidate", [
+    "valid", "expired", "invalid", "changed_point", "changed_csrf", "changed_provider",
+])
+async def test_repeat_tender_prefetches_fresh_gamma_info_while_price_page_loads(monkeypatch, candidate):
+    price_started = asyncio.Event()
+    prefetch_started = asyncio.Event()
+    prefetch_finished = asyncio.Event()
+    requests = []
+    provider = tumar.TumarCSP(api_key="unused", autofill=lambda _: False)
+    provider._ws = SimpleNamespace(state=State.OPEN)
+    provider.version = "2.0.0.0"
+    monkeypatch.setattr(provider, "encrypt_offer_price", AsyncMock(
+        return_value=tumar.EncryptResult(encrypted_data="ENC", session_key="SESSION",
+                                        info="SN", sign="SIGN")))
+    signer = SimpleNamespace(sign_xml_batch=AsyncMock(return_value={400: "CMS"}))
+    params = flow.AtagosBidParams(announce_id="100", tender_lot_ids=[1], tumar=provider)
+    base_url = "https://portal.test"
+
+    async def price_page(request):
+        price_started.set()
+        await prefetch_started.wait()
+        headers = {"set-cookie": "csrf_cookie=new; Path=/"} if candidate == "changed_csrf" else {}
+        return httpx.Response(
+            200, headers=headers,
+            html='<input id="public_key" value="CURRENT-KEY">'
+                 '<input app_lot_id="300" buy_lot_point_id="400">',
+        )
+
+    async def get_encr_info(request):
+        payload = parse_qs(request.content.decode())
+        point, = payload["lpId"]
+        version = "3.0.0.0" if requests and candidate == "changed_provider" else "2.0.0.0"
+        assert payload["version"] == [version]
+        requests.append((point, request.headers.get("cookie")))
+        if len(requests) == 1:
+            prefetch_started.set()
+            try:
+                await price_started.wait()
+                if candidate == "expired":
+                    return httpx.Response(
+                        302, headers={"location": "/ru/user/login",
+                                      "set-cookie": "ci_session=expired; Path=/"})
+                if candidate == "invalid":
+                    return httpx.Response(200, json={"info": "5_999;100;80;", "salt": "bad"})
+                if candidate == "changed_provider":
+                    provider.version = "3.0.0.0"
+                return httpx.Response(200, json={"info": f"5_{point};100;80;",
+                                                "salt": "prefetched", "sign": "SIGN"})
+            finally:
+                prefetch_finished.set()
+        assert prefetch_finished.is_set()
+        return httpx.Response(200, json={"info": "5_400;100;80;", "salt": "normal", "sign": "SIGN"})
+
+    async with respx.mock(base_url=base_url, assert_all_called=False) as router:
+        router.get("/ru/application/priceoffers/100/200").mock(side_effect=price_page)
+        router.post("/ru/application/ajax_get_encr_info/100/200").mock(side_effect=get_encr_info)
+        async with GoszakupClient(base_url=base_url, ci_session="ci_session=original; csrf_cookie=old") as client:
+            for method in ("add_encrypt", "save_gamma_signs", "priceoffers_next_gamma"):
+                monkeypatch.setattr(client, method, AsyncMock(return_value=httpx.Response(200, json={"status": "ok"})))
+            async with AsyncExitStack() as stack:
+                result = await asyncio.wait_for(flow._gamma_price(
+                    client, signer, params, "200", stack,
+                    cached_lp_id=401 if candidate == "changed_point" else 400,
+                ), 2)
+
+            assert result == ([400], {400: 80})
+            assert client.get_cookie("ci_session") == "original"
+            provider_info = provider.encrypt_offer_price.await_args.args[0]
+            assert provider_info.public_key == "CURRENT-KEY"
+            assert provider_info.id_priceoffer == "5_400"
+            assert client.add_encrypt.await_args.kwargs["salt"] == (
+                "prefetched" if candidate == "valid" else "normal")
+    expected_points = {
+        "valid": ["400"],
+        "changed_point": ["401", "400"],
+    }.get(candidate, ["400", "400"])
+    assert [point for point, _ in requests] == expected_points
+    if candidate == "changed_csrf":
+        assert "csrf_cookie=new" in requests[-1][1]
+
+
+def test_gamma_point_cache_key_requires_exact_single_selected_lot():
+    assert flow._single_lot_price_cache_key("100", [2, 2]) == "100:2"
+    assert flow._single_lot_price_cache_key("100", [2]) != flow._single_lot_price_cache_key("100", [3])
+    assert flow._single_lot_price_cache_key("100", [2]) != flow._single_lot_price_cache_key("300", [2])
+    assert flow._single_lot_price_cache_key("100", [2, 3]) is None
+
+
 @pytest.mark.parametrize(("stop_after_docs", "warmup_fails", "attempts"), [
     (False, False, 1), (False, True, 2), (True, False, 0),
 ])
@@ -142,18 +233,22 @@ async def test_bid_reconnects_during_draft_creation(monkeypatch, tmp_path, stop_
         tumar=provider, signer=SimpleNamespace(sign_text_with_tsa=AsyncMock(return_value="CMS")),
         doc_plan=[],
     )
+    cache = {"100": [401]}
     state = await asyncio.wait_for(flow.submit_bid(
         params=params, ci_session="dummy", gz_client=client,
         company={"subject_address": "address", "iik": "account"},
         beneficiary=None, state_store=StateStore(tmp_path),
+        lp_id_cache=cache,
     ), timeout=2)
 
     assert state.step == ("docs_ready" if stop_after_docs else "dry_run_complete")
     assert mock_connect.await_count == attempts
     if stop_after_docs:
         client.get_encr_info.assert_not_awaited()
+        assert cache == {"100": [401]}
     else:
         client.get_encr_info.assert_awaited_once_with("100", "200", lp_id=400, version="2.0.0.0")
+        assert cache == {"100": [401], "100:1": [400]}
 
 
 async def test_cancelled_signing_drains_its_reply_before_the_next_command():
