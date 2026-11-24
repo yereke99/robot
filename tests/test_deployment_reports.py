@@ -16,7 +16,7 @@ import pytest
 from goszakup.bot import git_sync, run_reports, windows_run
 from goszakup.bot.config import _report_chat_id
 from goszakup.bot.handlers import bid
-from goszakup.bot.log_capture import RuntimeLog
+from goszakup.bot.log_capture import RuntimeLog, public_bid_report
 from goszakup.timing import BidTrace, current_trace
 
 
@@ -338,6 +338,7 @@ async def test_managed_bid_automatically_sends_timing_only_to_owner(tmp_path, mo
     git_name = FILENAME.replace("run_", "bid_")
     monkeypatch.setitem(bid._BID_TRACES, 927, trace)
     monkeypatch.setattr(bid, "_LAST_REPORT", {})
+    monkeypatch.setattr(bid, "runtime_summary", lambda: "Windows 11 · Chrome 123.0.1111.22")
     reports = SimpleNamespace(chat_id=4, save_bid=AsyncMock(return_value=git_name))
     ctx = SimpleNamespace(
         config=SimpleNamespace(raw={"telegram": {"report_chat_ids": [4, 5]}}, log_dir=tmp_path),
@@ -348,3 +349,5 @@ async def test_managed_bid_automatically_sends_timing_only_to_owner(tmp_path, mo
     reports.save_bid.assert_awaited_once_with(trace, "public_ok", None)
     assert [call.kwargs["chat_id"] for call in bot.send_document.await_args_list] == [4]
     assert all(value in bid._LAST_REPORT[6][1] for value in (TENDER, APPLICATION, git_name))
+    assert "Chrome 123.0.1111.22" in bid._LAST_REPORT[6][1]
+    assert "Chrome" not in public_bid_report(trace, "public_ok")

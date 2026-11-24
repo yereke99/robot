@@ -49,6 +49,7 @@ from ...client import AlreadyPrepared, GoszakupClient, SessionExpired
 from ...pipeline import BidParams, finalize_application, submit_bid
 from ... import flow as flow_repairs
 from ...flow import AtagosBidParams, BeneficiaryInfo
+from ...host_diagnostics import runtime_summary
 from ...state import StateStore
 from ...timing import BidTrace, current_trace
 from ...timing import poll_interval_s as configured_poll_interval_s
@@ -85,7 +86,12 @@ async def deliver_timing_report(
         title = f"Тендер #{announce_id} · app {app_id or '—'}"
         if scheduled_elapsed is not None:
             title += f"\nОт T0 по расписанию {scheduled_elapsed:.2f} с"
-        text = trace.render(title=title)
+        try:
+            runtime = await asyncio.to_thread(runtime_summary)
+        except Exception as exc:
+            log.warning("bid.runtime_diagnostics_failed", error_type=type(exc).__name__)
+            runtime = ""
+        text = trace.render(title=title, runtime=runtime)
         stamp = time.strftime("%Y%m%d_%H%M%S")
         if git_name:
             text = f"Имя файла для GitHub {git_name}\n\n{text}"

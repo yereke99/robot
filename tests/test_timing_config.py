@@ -662,6 +662,23 @@ def test_publication_timeout_still_reports_when_the_request_started():
     assert expected in trace.render()
 
 
+def test_bid_trace_summarizes_portal_connections_and_measured_file_transfer():
+    trace = gz_timing.BidTrace()
+    event = gz_timing.TraceEvent
+    http = gz_timing.HttpTiming
+    trace.marks = [(1.0, "t0"), (6.0, "public_done")]
+    trace.events.extend([
+        event(0.0, 2.4, "HEAD", "/ru/", "200", http(2.4, "HTTP/1.1", 0, 1.0, 1.0)),
+        event(1.0, 1.2, "GET", "/files/download_file/10", "200", http(0.4, "HTTP/1.1", 1_000_000, 0.03, 0.05)),
+        event(3.0, 1.8, "POST", "/ru/application/ajax_public_application/1/2", "200", http(1.6, "HTTP/1.1", 26)),
+        event(5.0, 0.5, "GET", "/files/download_file/11", "200/ReadError", http(0.2, "HTTP/1.1", 2_000_000)),
+    ])
+    summary = trace.render_summary()
+    assert "HTTP/1.1 · до заголовков медиана 1.00 с (2 зап.)" in summary
+    assert "TCP 0.030 с (1 зам.) · TLS 0.050 с (1 зам.)" in summary
+    assert "1.00 МБ за 0.80 с · 10.0 Мбит/с на этом запросе" in summary
+
+
 def test_bid_trace_summary_uses_wall_time_for_overlapping_requests():
     event = gz_timing.TraceEvent
     trace = gz_timing.BidTrace()

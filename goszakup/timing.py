@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import contextvars
 import math
+import re
 import time
 from collections import Counter, defaultdict
+from statistics import median
 from typing import Callable, NamedTuple
 
 
@@ -100,6 +102,35 @@ def _http_elapsed(events: list[TraceEvent], start: float, end: float) -> float:
     return elapsed
 
 
+def _network_lines(events: list[TraceEvent]) -> list[str]:
+    received = [event for event in events if event.http and re.fullmatch(r"[1-5][0-9]{2}", event.status)]
+    if not received:
+        return []
+    metrics = [event.http for event in received]
+    versions = ", ".join(sorted({item.version for item in metrics if item.version}))
+    parts = [
+        f"Сеть {versions}" if versions else "Сеть",
+        f"до заголовков медиана {median(item.headers_s for item in metrics):.2f} с ({len(metrics)} зап.)",
+    ]
+    for label, values in (
+        ("TCP", [item.tcp_s for item in metrics if item.tcp_s > 0]),
+        ("TLS", [item.tls_s for item in metrics if item.tls_s > 0]),
+    ):
+        if values:
+            parts.append(f"{label} {median(values):.3f} с ({len(values)} зам.)")
+    lines = [" · ".join(parts)]
+    files = [event for event in received if event.kind == "GET" and "/files/download_file" in event.name
+             and event.status in {"200", "206"} and event.http.bytes_received >= 256 * 1024
+             and event.duration - event.http.headers_s >= 0.05]
+    if files:
+        biggest = max(files, key=lambda event: event.http.bytes_received)
+        size_mb = biggest.http.bytes_received / 1_000_000
+        body_s = biggest.duration - biggest.http.headers_s
+        lines.append(f"Крупнейшее тело файла · {size_mb:.2f} МБ за {body_s:.2f} с "
+                     f"· {size_mb * 8 / body_s:.1f} Мбит/с на этом запросе")
+    return lines
+
+
 def _operation(event: TraceEvent) -> str:
     if event.kind in _HTTP_METHODS:
         parts = event.name.strip("/").split("/")
@@ -187,6 +218,7 @@ class BidTrace:
             return ""
         duration = _http_elapsed(requests, origin, end)
         lines = [f"HTTP после старта подачи · {len(requests)} зап. · {duration:.2f} с без двойного счёта"]
+        lines.extend(_network_lines([event for event in requests if event.start >= origin]))
         polls = [event for event in requests if "/ajax_docs_next/" in event.name + "/"]
         marks = {name: when for when, name in self.marks}
         if "public_start" in marks and "public_done" not in marks:
@@ -232,13 +264,15 @@ class BidTrace:
             available -= len(line) + 1
         return "\n".join(selected)
 
-    def render(self, *, title: str = "") -> str:
+    def render(self, *, title: str = "", runtime: str = "") -> str:
         events = self._events()
         opened = next((t for t, name in self.marks if name == "t0"), None)
         base = opened if opened is not None else 0.0
         origin = "обнаружения открытия" if opened is not None else "старта"
         lines = [title or self.label,
                  time.strftime("%d.%m.%Y %H:%M:%S", time.localtime(self.wall0)), ""]
+        if runtime:
+            lines.extend(["СРЕДА ЗАПУСКА", runtime, "Запросы портала выполняет Python/httpx", ""])
         marks = {name: at for at, name in self.marks}
         public_start = marks.get("public_start")
         public_done = marks.get("public_done")
