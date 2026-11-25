@@ -45,6 +45,7 @@ from .handlers import settings as settings_handler
 from .history_db import HistoryDB
 from .instance_lock import BotAlreadyRunning, bot_instance
 from .run_reports import RunReports
+from .search import probe_portal_session
 from .texts import BOT_COMMANDS_RU
 
 log = structlog.get_logger("bot")
@@ -136,8 +137,10 @@ async def _post_init(application: Application) -> None:
     )
     try:
         t0 = time.monotonic()
-        await ctx.gz_client._http.head("/ru/", timeout=8.0)
-        log.info("bot.portal_prewarm", elapsed_ms=round((time.monotonic() - t0) * 1000))
+        if await ctx.gz_client.warm_connection(timeout_s=8.0):
+            log.info("bot.portal_prewarm", elapsed_ms=round((time.monotonic() - t0) * 1000))
+        else:
+            log.warning("bot.portal_prewarm_failed")
     except Exception as e:
         log.warning("bot.portal_prewarm_failed", error_type=type(e).__name__)
 
@@ -156,21 +159,23 @@ async def _post_init(application: Application) -> None:
                 if ctx.gz_client is None:
                     continue
                 ticks += 1
-                try:
-                    await ctx.gz_client._http.head("/ru/", timeout=5.0)
-                except Exception as e:
-                    logging.debug("opt4.gz_client.heartbeat failed: %r", e)
+                await ctx.gz_client.warm_connection(timeout_s=5.0)
 
-                # Каждые 3-4 минуты отправляем запрос в кабинет для продления жизни ci_session
-                if ticks % 6 == 0 and ctx.ci_session():
-                    try:
-                        r = await ctx.gz_client._http.get("/cabinet/profile", timeout=8.0, follow_redirects=False)
-                        if r.status_code == 200:
-                            logging.debug("session keepalive: ci_session active")
-                        elif r.status_code in (301, 302) and "/user/login" in (r.headers.get("location") or ""):
-                            logging.warning("session keepalive: cookie expired on portal")
-                    except Exception as e:
-                        logging.debug("session keepalive error: %r", e)
+                # Scheduled tenders check their own cabinet session more often.
+                # The shared client's check is read-only and never follows SSO.
+                session = ctx.gz_client.get_cookie("ci_session")
+                if ticks % 6 == 0 and session and not ctx.bid_lock.locked():
+                    revision = ctx.portal_session_changed
+                    status = await probe_portal_session(ctx.gz_client)
+                    if (status != "unavailable"
+                            and not ctx.bid_lock.locked()
+                            and not revision.is_set()
+                            and ctx.gz_client.get_cookie("ci_session") == session):
+                        ctx.last_cookie_probe = (time.time(), status == "active")
+                    if status in ("expired", "sso"):
+                        log.warning("bot.portal_session.expired", status=status)
+                    else:
+                        log.debug("bot.portal_session.check", status=status)
             except asyncio.CancelledError:
                 return
             except Exception as e:

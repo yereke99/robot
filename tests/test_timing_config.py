@@ -64,7 +64,7 @@ def fake_tumar(monkeypatch):
 async def _startup(monkeypatch, defaults, *, menu_error=None):
     """Call real startup while replacing every service, secret and disk read."""
     monkeypatch.setattr(popup_filler, "is_elevated", lambda: True)
-    client = SimpleNamespace(_http=SimpleNamespace(head=AsyncMock()))
+    client = SimpleNamespace(warm_connection=AsyncMock(return_value=True))
     monkeypatch.setattr(main, "GoszakupClient", Mock(return_value=client))
     ctx = SimpleNamespace(
         config=SimpleNamespace(
@@ -397,7 +397,8 @@ async def test_multi_bid_adds_each_tenders_own_diagnostics_to_its_result(monkeyp
     progress = {announce_id: SimpleNamespace(update=Mock(), finish=AsyncMock(), cancel=Mock())
                 for announce_id in outcomes}
 
-    async def run_pipeline(*args, announce_id, **kwargs):
+    async def run_pipeline(ctx, *args, announce_id, **kwargs):
+        assert ctx.bid_lock.locked()
         ok, app_id, message, row_id = outcomes[announce_id]
         trace = gz_timing.BidTrace(f"#{announce_id}")
         route = "ajax_priceoffers_next" if ok else "ajax_docs_next"
@@ -411,6 +412,7 @@ async def test_multi_bid_adds_each_tenders_own_diagnostics_to_its_result(monkeyp
     ctx = SimpleNamespace(
         gz_client=SimpleNamespace(discover_announce_lots=AsyncMock(return_value=[{"lot_id": 42}])),
         bid_settings={"dry_run": True},
+        bid_lock=asyncio.Lock(),
     )
     context = SimpleNamespace(application=SimpleNamespace(bot_data={"ctx": ctx}), bot=object())
     update = SimpleNamespace(effective_chat=SimpleNamespace(id=3),

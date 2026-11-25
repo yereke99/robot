@@ -42,10 +42,10 @@ import re
 from ..auth import whitelist_only
 from ..context import BidQueueItem, BotContext
 from . import settings as settings_handler
+from .common import accept_portal_cookie, activate_portal_cookie
 from ..progress import ProgressMessage, current_progress
 from ..search import probe_cookie
 from ..texts import BID_QUEUE_YOUR_TURN, BUSY_QUEUE, CANCELLED
-from ... import secrets as gz_secrets
 from ...client import AlreadyPrepared, GoszakupClient, SessionExpired
 from ...pipeline import BidParams, finalize_application, submit_bid
 from ... import flow as flow_repairs
@@ -264,29 +264,19 @@ async def _ensure_tumar(ctx: BotContext, raw_tumarcsp: dict):
 async def _ensure_logged_in(ctx: BotContext) -> bool:
     """Make sure the shared client's cookie is alive.
 
-    If the probe says it's dead, run the 5-step ECP login on the SAME client
-    so the bid pipeline can skip auto-login. Returns True if we end up
-    logged in, False otherwise (caller surfaces SessionExpired).
+    Try legacy ECP on an isolated client so failed login cannot clear the
+    shared cookie. The bid pipeline borrows that client's active session.
     """
     if await _is_cookie_fresh(ctx):
         return True
     if not ctx.account_password or ctx.gz_client is None:
         return False
     try:
-        ci = await ctx.gz_client.login(
+        ci = await ctx.gz_client.relogin_isolated(
             account_password=ctx.account_password,
             kalkan_signer=ctx.signer,
         )
-        # gz_secrets imported at module top — `..` would point at
-        # goszakup.bot (no `secrets` module there); the correct relative
-        # is at module level already.
-        try:
-            gz_secrets.set(ctx.config.ci_session_service, "ci_session", ci)
-        except Exception:
-            pass
-        ctx.set_ci_session(ci)
-        ctx.last_login_at = time.time()
-        ctx.last_cookie_probe = (time.time(), True)
+        await activate_portal_cookie(ctx, f"ci_session={ci}", ci)
         log.info("opt1.bot_relogin.done")
         return True
     except Exception as e:
@@ -553,7 +543,10 @@ async def _multi_bid(
             log.exception("multi_bid.failed", announce=announce_id)
             await pm.finish(f"❌ <b>#{announce_id}</b> — ошибка: {escape(_exception_message(e)[:200])}")
 
-    await asyncio.gather(*[_one(aid) for aid in announce_ids])
+    # Keep submissions within the batch parallel while excluding other account
+    # operations that could replace its portal session.
+    async with ctx.bid_lock:
+        await asyncio.gather(*[_one(aid) for aid in announce_ids])
 
 
 def _looks_like_cookie(text: str) -> bool:
@@ -570,60 +563,7 @@ async def text_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Plain text (число, goszakup URL, or raw cookie)."""
     text = (update.message.text or "").strip()
     if _looks_like_cookie(text):
-        raw = text.strip('"').strip("'")
-        ctx = _ctx(context)
-        msg = await update.message.reply_text("🔍 Проверяю сессию и доступ в личный кабинет…")
-
-        cookie_header = None
-        ci_session_val = None
-        if "curl " in raw.lower() and "-b " in raw:
-            m_b = re.search(r'-(?:b|-cookie)\s+["\']?([^"\'\n]+)["\']?', raw)
-            if m_b:
-                raw = m_b.group(1).replace("^", "").strip()
-
-        if ";" in raw or "BNES_" in raw or "agreement_user_2024=" in raw:
-            cookie_header = raw
-            m = re.search(r"ci_session=([^;\s]+)", raw)
-            ci_session_val = m.group(1) if m else raw
-        else:
-            ci_session_val = raw
-            cookie_header = None
-
-        if cookie_header:
-            ctx.set_ci_session(cookie_header)
-            gz_secrets.set(ctx.config.ci_session_service, "cookie_header", cookie_header)
-            if ci_session_val:
-                gz_secrets.set(ctx.config.ci_session_service, "ci_session", ci_session_val)
-        else:
-            ctx.set_ci_session(ci_session_val)
-            gz_secrets.set(ctx.config.ci_session_service, "ci_session", ci_session_val)
-
-        import time
-        ctx.last_login_at = time.time()
-        try:
-            alive = await probe_cookie(ctx.gz_client)
-            if alive:
-                ctx.last_cookie_probe = (time.time(), True)
-                await msg.edit_text(
-                    "✅ <b>Cookie успешно сохранена и проверена!</b>\n\n"
-                    "Личный кабинет активен. Теперь можете отправить номер закупки (тендера) для подачи заявки.",
-                    parse_mode="HTML",
-                )
-            else:
-                ctx.last_cookie_probe = (time.time(), False)
-                await msg.edit_text(
-                    "⚠️ <b>Cookie сохранена, но сайт перенаправляет на страницу входа.</b>\n\n"
-                    "Это значит, что на портале сессия не авторизована или уже истекла.\n\n"
-                    "Пожалуйста:\n"
-                    "1. Откройте <a href='https://v3bl.goszakup.gov.kz/cabinet/profile'>https://v3bl.goszakup.gov.kz/cabinet/profile</a>\n"
-                    "2. Убедитесь, что личный кабинет открыт под вашей ЭЦП.\n"
-                    "3. Скопируйте свежее значение <code>ci_session</code> из Cookies (F12) и пришлите сюда.",
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-        except Exception as e:
-            ctx.last_cookie_probe = None
-            await msg.edit_text(f"⚠️ Cookie сохранена в боте. (Ошибка при проверке профиля: {e})", parse_mode="HTML")
+        await accept_portal_cookie(update, context, text)
         return ConversationHandler.END
 
     # Поиск всех номеров закупки в сообщении (для параллельной подачи нескольких тендеров)

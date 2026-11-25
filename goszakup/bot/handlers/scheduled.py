@@ -6,12 +6,12 @@
     /schedule 17058849 09:00 17058850 09:00     ← несколько тендеров
 
 Как работает (fast-T0, две фазы):
-    1. За WARMUP_LEAD_S до T0 — login, pool x6, TumarCSP
+    1. За WARMUP_LEAD_S до T0 — проверка сессии, pool x6, TumarCSP
     2. Сразу после прогрева — poll открытия; как только тендер открыт —
        PHASE-1: create+lots+docs → черновик на /priceoffers/ (stop_after_docs)
     3. В wall-clock T0 (или сразу, если позже) — PHASE-2: только gamma+submit
        по resume_app_id; если документы ещё не готовы, сначала завершаем их
-    4. Несколько тендеров — параллельно
+    4. Ожидание открытия — параллельно; изменения на портале — под общим замком.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from collections.abc import Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from html import escape
 try:
     from zoneinfo import ZoneInfo
     _TZ = ZoneInfo("Asia/Almaty")
@@ -44,10 +45,11 @@ from telegram.ext import CommandHandler, ContextTypes
 
 from ..auth import whitelist_only
 from ..context import BotContext
+from ..search import probe_portal_session
 from . import settings as settings_handler
 from .bid import deliver_timing_report
 from ... import flow as flow_repairs
-from ...client import GoszakupClient
+from ...client import GoszakupClient, PORTAL_LOGIN_URL, PortalLoginRequired, SessionExpired
 from ...flow import AtagosBidParams, BeneficiaryInfo
 from ...local_signer import LocalSigner
 from ...state import StateStore
@@ -55,7 +57,7 @@ from ...timing import BidTrace, current_trace, poll_interval_s
 
 log = structlog.get_logger("scheduled")
 
-# Сколько секунд до T0 начинаем прогрев (login, pool, TumarCSP)
+# Сколько секунд до T0 начинаем прогрев (сессия, pool, TumarCSP)
 WARMUP_LEAD_S = 300   # 5 минут
 # Шаг уведомления "ждём T0" в секундах
 NOTIFY_INTERVAL_S = 60
@@ -66,7 +68,7 @@ NOTIFY_INTERVAL_S = 60
 @dataclass
 class ScheduledTender:
     announce_id: str
-    t0: datetime          # точное UTC+6 время открытия
+    t0: datetime          # местное время открытия (Asia/Almaty)
     lot_ids: list[int]    # заполняется при discover (пусто = авто)
 
 
@@ -146,27 +148,20 @@ async def _warmup_one(ctx: BotContext, tender: ScheduledTender,
     raw_ben = ctx.config.raw.get("beneficiary", {})
 
     # Создаём отдельный HTTP клиент для этого тендера
+    credential_event = ctx.portal_session_changed
+    credential = ctx.ci_session()
     gz = await stack.enter_async_context(GoszakupClient(
-        ci_session=ctx.ci_session(),
+        ci_session=credential,
         agreement_cookie=ctx.agreement_cookie(),
         base_url=ctx.config.base_url,
         proxy=ctx.config.proxy_url,
     ))
 
-    # Логинимся через ЭЦП если есть пароль кабинета, иначе переиспользуем куку
-    try:
-        if ctx.account_password and ctx.signer:
-            ci = await gz.login(
-                account_password=ctx.account_password,
-                kalkan_signer=ctx.signer,
-            )
-            ctx.set_ci_session(ci)
-            log.info("scheduled.warmup.login", announce=tender.announce_id)
-        else:
-            log.info("scheduled.warmup.reusing_cookie", announce=tender.announce_id)
-    except Exception as e:
-        log.warning("scheduled.warmup.login_failed", announce=tender.announce_id,
-                    err=str(e)[:100])
+    # Seed from the live jar, which may already have rotated since /cookie.
+    # Never log in at every warmup: a new login invalidates the account's old
+    # session, including the one actively used by another tender.
+    if ctx.gz_client is not None:
+        ctx.gz_client.sync_cookies_to(gz)
 
     # Прогрев doc_pool — 6 параллельных сессий.
     # Сайт допускает только ОДНУ активную сессию на аккаунт: каждый новый
@@ -195,7 +190,7 @@ async def _warmup_one(ctx: BotContext, tender: ScheduledTender,
              elapsed_s=round(time.monotonic() - t0_pool, 2))
 
     # Прогрев TumarCSP
-    from ...flow import _open_tumar, AtagosBidParams, DEFAULT_DOC_PLAN
+    from ...flow import _open_tumar
     flow_params = AtagosBidParams(
         announce_id=tender.announce_id,
         tender_lot_ids=tender.lot_ids or [0],
@@ -233,7 +228,7 @@ async def _warmup_one(ctx: BotContext, tender: ScheduledTender,
     return {
         "gz": gz, "ns": ns, "doc_pool": doc_pool,
         "tumar": tumar, "beneficiary": beneficiary,
-        "flow_params": flow_params,
+        "credential_event": credential_event,
     }
 
 
@@ -244,6 +239,261 @@ async def _warmup_one(ctx: BotContext, tender: ScheduledTender,
 # Максимальное время ожидания открытия тендера (poll). Warmup начинается за
 # 5 мин до T0 — даём запас если открытие чуть позже расписания.
 POST_T0_WAIT_S = 300  # 5 минут
+SESSION_KEEPALIVE_S = 60
+SESSION_FINAL_CHECK_LEAD_S = 15
+SESSION_CHECK_TIMEOUT_S = 5.0
+SESSION_CHANGE_POLL_S = 1.0
+LEGACY_LOGIN_TIMEOUT_S = 5.0
+_LOGIN_GUIDANCE = (
+    f'<a href="{PORTAL_LOGIN_URL}">Войдите в личный кабинет</a> '
+    "через браузер и обновите сессию командой /cookie <b>в личном чате с ботом</b>."
+)
+
+
+class _ScheduledWaitError(RuntimeError):
+    """The job cannot safely start the write phase."""
+
+
+class _ScheduledWriteAuthError(RuntimeError):
+    """The portal rejected the session after the write phase started."""
+
+
+class _ScheduledSession:
+    """Maintain the per-job portal session only between read/write phases."""
+
+    def __init__(self, ctx: BotContext, tender: ScheduledTender, warmed: dict,
+                 notify: Callable[[str], None], t0: float, deadline: float):
+        self.ctx, self.tender = ctx, tender
+        self.gz = warmed["gz"]
+        self.credential_event = warmed["credential_event"]
+        self.doc_pool = warmed["doc_pool"]
+        self.notify = notify
+        self.t0 = t0
+        self.deadline = deadline
+        self.final_check_at = t0 - SESSION_FINAL_CHECK_LEAD_S
+        self.deadline_check_at = deadline - SESSION_CHECK_TIMEOUT_S
+        self.next_check = time.monotonic()
+        self.final_check_done = False
+        self.deadline_check_done = False
+        self.expired = False
+        self.legacy_attempted = False
+        self.session_alerted = False
+        self.network_alerted = False
+        self.last_profile_status = "unavailable"
+
+    def _adopt_operator_update(self) -> bool:
+        event = self.ctx.portal_session_changed
+        if event is self.credential_event:
+            return False
+        self.credential_event = event
+        fresh = self.ctx.ci_session()
+        if not fresh:
+            return False
+        if self.ctx.gz_client is not None:
+            self.ctx.gz_client.sync_cookies_to(self.gz)
+        else:
+            self.gz.adopt_ci_session(fresh)
+        self.gz._create_form_html.pop(self.tender.announce_id, None)
+        self.next_check = time.monotonic()
+        return True
+
+    def _session_ok(self) -> None:
+        self.expired = self.legacy_attempted = False
+        if self.session_alerted:
+            self.notify(f"✅ <b>#{self.tender.announce_id}</b> — сессия Госзакупок "
+                        "проверена. Продолжаю эту запланированную подачу.")
+        self.session_alerted = self.network_alerted = False
+
+    def _session_expired(self) -> None:
+        self.expired = True
+        if not self.session_alerted:
+            self.session_alerted = True
+            t0_str = self.tender.t0.strftime("%H:%M:%S")
+            self.notify(
+                f"⚠️ <b>#{self.tender.announce_id}</b> — сессия Госзакупок "
+                f"истекла (T0 {t0_str}, Алматы). "
+                f"{_LOGIN_GUIDANCE} Бот продолжит эту подачу после проверки новой сессии."
+            )
+            log.warning("scheduled.session.expired", announce=self.tender.announce_id)
+
+    def _check_boundary(self, now: float) -> float:
+        # Don't put an extra profile round trip into the final seconds before
+        # T0. Opening poll still detects explicit auth failures at this point.
+        if not self.final_check_done and now > self.final_check_at + 5.0:
+            self.final_check_done = True
+        boundary = self.next_check
+        if not self.final_check_done:
+            boundary = min(boundary, self.final_check_at)
+        if not self.deadline_check_done:
+            boundary = min(boundary, self.deadline_check_at)
+        return boundary
+
+    async def _check_profile(self) -> None:
+        now = time.monotonic()
+        if now >= self.final_check_at:
+            self.final_check_done = True
+        if now >= self.deadline_check_at:
+            self.deadline_check_done = True
+        # Another bid owns this account's active portal session. Skip this
+        # heartbeat instead of getting in front of its writes.
+        if self.ctx.bid_lock.locked():
+            self.next_check = now + 5.0
+            return
+        # The authenticated GET via peek doesn't apply Set-Cookie. It can run
+        # without holding the write lock against an operator's /cookie; ignore
+        # an in-flight result if that command installed a newer credential.
+        change_event = self.credential_event
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        result = (
+            await probe_portal_session(self.gz, timeout_s=min(SESSION_CHECK_TIMEOUT_S, remaining))
+            if self.gz.get_cookie("ci_session") else "expired"
+        )
+        if change_event.is_set():
+            self.next_check = time.monotonic()
+            return
+        self.last_profile_status = result
+        self.next_check = time.monotonic() + SESSION_KEEPALIVE_S
+        log.info("scheduled.session.check", announce=self.tender.announce_id,
+                 status=result)
+        if result == "active":
+            self._session_ok()
+        elif result in ("expired", "sso"):
+            if result == "sso":
+                self.legacy_attempted = True
+            self._session_expired()
+        elif now >= self.final_check_at and not self.expired and not self.network_alerted:
+            self.network_alerted = True
+            self.notify(
+                f"⚠️ <b>#{self.tender.announce_id}</b> — портал не ответил "
+                "на проверку сессии. Это не подтверждает её истечение; "
+                "бот продолжает попытки."
+            )
+
+    async def _try_legacy_once(self) -> None:
+        if self.legacy_attempted or not self.ctx.account_password or not self.ctx.signer:
+            return
+        now = time.monotonic()
+        if self.ctx.bid_lock.locked() or self.deadline <= now or self.final_check_at <= now <= self.t0:
+            return
+        async with self.ctx.bid_lock:
+            if self._adopt_operator_update():
+                return  # verify the operator's newer session before a legacy login
+            self.legacy_attempted = True
+            try:
+                async with asyncio.timeout(min(LEGACY_LOGIN_TIMEOUT_S, self.deadline - time.monotonic())):
+                    ci = await self.gz.relogin_isolated(
+                        account_password=self.ctx.account_password,
+                        kalkan_signer=self.ctx.signer,
+                    )
+                    if await probe_portal_session(self.gz, timeout_s=SESSION_CHECK_TIMEOUT_S) != "active":
+                        return
+            except PortalLoginRequired:
+                log.info("scheduled.session.sso_required", announce=self.tender.announce_id)
+                return
+            except Exception as exc:
+                log.warning("scheduled.session.legacy_failed", announce=self.tender.announce_id,
+                            error_type=type(exc).__name__)
+                return
+            self.ctx.set_ci_session(ci)
+            self.credential_event = self.ctx.portal_session_changed
+            if self.ctx.gz_client is not None:
+                self.gz.sync_cookies_to(self.ctx.gz_client)
+            self._session_ok()
+
+    async def _poll_once(self, duration: float) -> bool:
+        # Wake immediately on a confirmed /cookie update, even if the old
+        # session's create page only says 404 rather than redirecting to login.
+        changed = self.credential_event
+        ready = asyncio.create_task(self.gz.poll_announce_ready(
+            self.tender.announce_id,
+            interval_s=poll_interval_s(self.ctx.config.raw),
+            max_wait_s=duration,
+        ))
+        update = asyncio.create_task(changed.wait())
+        try:
+            await asyncio.wait((ready, update), return_when=asyncio.FIRST_COMPLETED)
+            if changed.is_set():
+                return False
+            await ready
+            return True
+        finally:
+            pending = (ready, update)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _wait(self, until: float, *, poll_open: bool) -> None:
+        while (now := time.monotonic()) < self.deadline:
+            changed = self._adopt_operator_update()
+            if changed or now >= self._check_boundary(now):
+                await self._check_profile()
+            if time.monotonic() >= self.deadline:
+                break
+            if self.expired:
+                await self._try_legacy_once()
+                if self.expired:
+                    await asyncio.sleep(min(SESSION_CHANGE_POLL_S, max(0.0, self.deadline - time.monotonic())))
+                    continue
+            if not poll_open and time.monotonic() >= until:
+                return
+            now = time.monotonic()
+            boundary = min(self.deadline, self._check_boundary(now))
+            if poll_open:
+                if boundary <= now:
+                    continue
+                try:
+                    ready = await self._poll_once(boundary - now)
+                except PortalLoginRequired:
+                    self.legacy_attempted = True  # don't retry the retired auth route
+                    self._session_expired()
+                except SessionExpired:
+                    self._session_expired()
+                except TimeoutError:
+                    continue
+                else:
+                    if ready:
+                        self._session_ok()
+                        return
+            else:
+                await asyncio.sleep(max(0.0, min(until, boundary) - now))
+        if self.expired:
+            raise _ScheduledWaitError(
+                "сессия Госзакупок истекла и не была восстановлена до конца ожидания. "
+                "Тендер не отправлен."
+            )
+        if self.last_profile_status == "unavailable":
+            raise _ScheduledWaitError(
+                "портал не подтвердил состояние сессии или открытие приёма заявок "
+                "до конца ожидания."
+            )
+        raise _ScheduledWaitError(
+            "портал не открыл приём заявок до конца ожидания."
+            if poll_open else "не удалось дождаться начала подачи."
+        )
+
+    async def wait_for_write(self, stack: AsyncExitStack, until: float, *, poll_open: bool) -> None:
+        while True:
+            await self._wait(until, poll_open=poll_open)
+            # Validate credential updates between a successful poll and
+            # write-lock acquisition, so a cached form never spans a login.
+            try:
+                async with asyncio.timeout_at(asyncio.get_running_loop().time()
+                                              + max(0.0, self.deadline - time.monotonic())):
+                    async with AsyncExitStack() as lock_scope:
+                        await lock_scope.enter_async_context(self.ctx.bid_lock)
+                        if self._adopt_operator_update():
+                            continue
+                        for sib, _ in self.doc_pool:
+                            self.gz.sync_cookies_to(sib)
+                        stack.push_async_callback(lock_scope.pop_all().aclose)
+                        return
+            except TimeoutError as exc:
+                raise _ScheduledWaitError("не удалось дождаться очереди на подачу.") from exc
+
+    async def wait_until_t0(self, t0: float) -> None:
+        await self._wait(t0, poll_open=False)
 
 
 def _resolve_lot_ids(tender: ScheduledTender, warmed: dict) -> list[int]:
@@ -296,7 +546,8 @@ def _bid_settings(ctx: BotContext, chat_id: int, bot, *, for_prepare: bool):
 async def _prepare_one(ctx: BotContext, tender: ScheduledTender,
                        warmed: dict, chat_id: int, bot,
                        *, max_poll_wait_s: float,
-                       notify: Callable[[str], None]) -> tuple[bool, str]:
+                       notify: Callable[[str], None],
+                       poll_ready=None) -> tuple[bool, str]:
     """PHASE-1: довести черновик до /priceoffers/ (без цены и без submit)."""
     cfg = _bid_settings(ctx, chat_id, bot, for_prepare=True)
     raw_tumarcsp = ctx.config.raw.get("tumarcsp", {})
@@ -330,7 +581,6 @@ async def _prepare_one(ctx: BotContext, tender: ScheduledTender,
                 tumar_ws_url=raw_tumarcsp.get("ws_url", "wss://127.0.0.1:6127/tumarcsp/"),
                 autofill_price_popup=raw_tumarcsp.get("autofill_popup", False),
                 popup_coords=raw_tumarcsp.get("popup"),
-                auto_login_account_password=ctx.account_password,
                 skip_initial_login=True,
                 doc_save_mode=cfg["defaults"].get("doc_save_mode", "serial"),
                 **flow_repairs.speed_options(settings_handler.speed_defaults(ctx)),
@@ -359,12 +609,19 @@ async def _prepare_one(ctx: BotContext, tender: ScheduledTender,
             reuse_doc_pool=warmed["doc_pool"],
             tz_sig_cache=ctx.tz_sig_cache,
             on_open=_on_open,
+            poll_ready=poll_ready,
         )
         if state.step == "docs_ready" and state.application_id:
             warmed["app_id"] = state.application_id
             warmed["lot_ids"] = lot_ids
             return True, state.application_id
         return False, state.error or state.step
+    except _ScheduledWaitError:
+        raise
+    except SessionExpired as exc:
+        raise _ScheduledWriteAuthError(
+            "сессия Госзакупок истекла при подготовке заявки."
+        ) from exc
     except Exception as e:
         log.exception("scheduled.prepare.failed", announce=tender.announce_id)
         return False, str(e)[:300]
@@ -373,7 +630,8 @@ async def _prepare_one(ctx: BotContext, tender: ScheduledTender,
 async def _fire_one(ctx: BotContext, tender: ScheduledTender,
                     warmed: dict, chat_id: int, bot,
                     *, resume_app_id: str | None = None,
-                    pre_t0_poll: bool = False) -> tuple[str, str]:
+                    pre_t0_poll: bool = False,
+                    poll_ready=None) -> tuple[str, str]:
     """PHASE-2: gamma + submit. Если resume_app_id задан — без create/docs."""
     cfg = _bid_settings(ctx, chat_id, bot, for_prepare=False)
     raw_tumarcsp = ctx.config.raw.get("tumarcsp", {})
@@ -401,7 +659,6 @@ async def _fire_one(ctx: BotContext, tender: ScheduledTender,
                 tumar_ws_url=raw_tumarcsp.get("ws_url", "wss://127.0.0.1:6127/tumarcsp/"),
                 autofill_price_popup=raw_tumarcsp.get("autofill_popup", False),
                 popup_coords=raw_tumarcsp.get("popup"),
-                auto_login_account_password=ctx.account_password,
                 skip_initial_login=True,
                 doc_save_mode=cfg["defaults"].get("doc_save_mode", "serial"),
                 **flow_repairs.speed_options(settings_handler.speed_defaults(ctx)),
@@ -430,12 +687,19 @@ async def _fire_one(ctx: BotContext, tender: ScheduledTender,
             # Never prewarm doc pool on resume — phase-2 is gamma+public only.
             reuse_doc_pool=([] if resume_app_id else warmed["doc_pool"]),
             tz_sig_cache=ctx.tz_sig_cache,
+            poll_ready=poll_ready,
         )
         if state.step == "submit_declined":
             return state.step, "подача отменена вами (черновик готов, можно подать вручную)"
         if state.step in ("public_ok", "dry_run_complete"):
             return state.step, str(state.application_id or "")
         return state.step, state.error or state.step
+    except _ScheduledWaitError:
+        raise
+    except SessionExpired as exc:
+        raise _ScheduledWriteAuthError(
+            "сессия Госзакупок истекла при подаче заявки."
+        ) from exc
     except Exception as e:
         log.exception("scheduled.fire.failed", announce=tender.announce_id)
         return "error", str(e)[:300]
@@ -509,60 +773,78 @@ async def _run_scheduled(ctx: BotContext, tenders: list[ScheduledTender],
 
             app_id: str | None = None
 
-            if fast_t0:
-                # PHASE-1: poll открытия сразу (не ждём wall T0) + docs.
-                # Если тендер откроется в T0 — документы поедут с первой секунды.
-                # PHASE-2 начнётся только после готовности документов.
-                remaining_to_deadline = max(
-                    60.0,
-                    (tender.t0 - _now()).total_seconds() + POST_T0_WAIT_S,
-                )
-                t_prep = time.monotonic()
-                ok_prep, prep_msg = await _prepare_one(
-                    ctx, tender, warmed, chat_id, bot,
-                    max_poll_wait_s=remaining_to_deadline, notify=notify,
-                )
-                prep_elapsed = round(time.monotonic() - t_prep, 1)
-                if ok_prep:
-                    app_id = prep_msg
-                    notify(
-                        f"📄 <b>#{tender.announce_id}</b> — документы готовы "
-                        f"(app <code>{app_id}</code>, {prep_elapsed}с).\n"
-                        "Подам цену не раньше T0…"
-                    )
-                else:
-                    notify(
-                        f"⚠️ <b>#{tender.announce_id}</b> — prepare не удался:\n"
-                        f"<code>{prep_msg[:250]}</code>\n"
-                        "В T0 попробую полный пайплайн…"
-                    )
+            # The same deadline bounds preflight, opening polling and operator
+            # recovery. An auth failure never starts a second 300 s open wait.
+            deadline = scheduled_t0_mono + POST_T0_WAIT_S
+            session = _ScheduledSession(ctx, tender, warmed, notify, scheduled_t0_mono, deadline)
+            try:
+                if fast_t0:
+                    t_prep = time.monotonic()
+                    async with AsyncExitStack() as writes:
+                        async def _prepare_at_open():
+                            await session.wait_for_write(writes, scheduled_t0_mono, poll_open=True)
 
-            # ── ЖДЁМ WALL-CLOCK T0 (если ещё не наступил) ─────────
-            wait_s = (tender.t0 - _now()).total_seconds()
-            if wait_s > 0:
-                await asyncio.sleep(wait_s)
-            phase2_started_mono = time.monotonic()
+                        ok_prep, prep_msg = await _prepare_one(
+                            ctx, tender, warmed, chat_id, bot,
+                            max_poll_wait_s=max(0.0, deadline - t_prep), notify=notify,
+                            poll_ready=_prepare_at_open,
+                        )
+                    prep_elapsed = round(time.monotonic() - t_prep, 1)
+                    if ok_prep:
+                        app_id = prep_msg
+                        notify(
+                            f"📄 <b>#{tender.announce_id}</b> — документы готовы "
+                            f"(app <code>{escape(app_id)}</code>, {prep_elapsed}с).\n"
+                            "Подам цену не раньше T0…"
+                        )
+                    else:
+                        notify(
+                            f"⚠️ <b>#{tender.announce_id}</b> — prepare не удался:\n"
+                            f"<code>{escape(prep_msg[:250])}</code>\n"
+                            "В T0 попробую полный пайплайн…"
+                        )
 
-            # ── PHASE-2: цена + submit ────────────────────────────
-            if app_id:
+                if time.monotonic() < scheduled_t0_mono:
+                    await session.wait_until_t0(scheduled_t0_mono)
+                phase2_started_mono = time.monotonic()
+
+                async with AsyncExitStack() as writes:
+                    if app_id:
+                        await session.wait_for_write(writes, scheduled_t0_mono, poll_open=False)
+                        notify(
+                            f"🚀 <b>#{tender.announce_id}</b> — T0! "
+                            f"Цена+submit (fast path, app <code>{escape(app_id)}</code>)…"
+                        )
+                        status, detail = await _fire_one(
+                            ctx, tender, warmed, chat_id, bot,
+                            resume_app_id=app_id,
+                            pre_t0_poll=False,
+                        )
+                        mode = "fast-T0"
+                    else:
+                        async def _fire_at_open():
+                            await session.wait_for_write(writes, scheduled_t0_mono, poll_open=True)
+
+                        notify(f"🚀 <b>#{tender.announce_id}</b> — T0! Полный пайплайн…")
+                        status, detail = await _fire_one(
+                            ctx, tender, warmed, chat_id, bot,
+                            resume_app_id=None,
+                            pre_t0_poll=True,
+                            poll_ready=_fire_at_open,
+                        )
+                        mode = "full"
+            except _ScheduledWaitError as exc:
+                elapsed = round(max(0.0, time.monotonic() - scheduled_t0_mono), 1)
+                notify(f"❌ <b>#{tender.announce_id}</b> — {escape(str(exc))}")
+                return "schedule_wait_failed", app_id, elapsed
+            except _ScheduledWriteAuthError as exc:
+                elapsed = round(max(0.0, time.monotonic() - scheduled_t0_mono), 1)
                 notify(
-                    f"🚀 <b>#{tender.announce_id}</b> — T0! "
-                    f"Цена+submit (fast path, app <code>{app_id}</code>)…"
+                    f"❌ <b>#{tender.announce_id}</b> — {escape(str(exc))}\n"
+                    f"{_LOGIN_GUIDANCE} Проверьте состояние черновика на портале. "
+                    "Бот не повторял запросы на подачу."
                 )
-                status, detail = await _fire_one(
-                    ctx, tender, warmed, chat_id, bot,
-                    resume_app_id=app_id,
-                    pre_t0_poll=False,
-                )
-                mode = "fast-T0"
-            else:
-                notify(f"🚀 <b>#{tender.announce_id}</b> — T0! Полный пайплайн…")
-                status, detail = await _fire_one(
-                    ctx, tender, warmed, chat_id, bot,
-                    resume_app_id=None,
-                    pre_t0_poll=True,
-                )
-                mode = "full"
+                return "schedule_write_auth_failed", app_id, elapsed
             completed_mono = time.monotonic()
             elapsed = round(max(0.0, completed_mono - scheduled_t0_mono), 1)
             phase2_elapsed = round(completed_mono - phase2_started_mono, 1)
@@ -574,7 +856,7 @@ async def _run_scheduled(ctx: BotContext, tenders: list[ScheduledTender],
                           f"app <code>{detail}</code>")
             else:
                 result = (f"❌ <b>#{tender.announce_id}</b> — ошибка:\n"
-                          f"<code>{detail[:300]}</code>")
+                          f"<code>{escape(detail[:300])}</code>")
             phase = "фаза подготовки" if status == "dry_run_complete" else "фаза подачи"
             notify(f"{result}\n⏱ {elapsed}с от T0 ({mode}); {phase}: {phase2_elapsed}с")
             return status, detail if status in ("public_ok", "dry_run_complete") else app_id, elapsed

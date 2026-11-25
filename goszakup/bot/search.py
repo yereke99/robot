@@ -18,12 +18,15 @@ When a tender is status 220, submit_bid must poll until the form opens
 
 from __future__ import annotations
 
+import asyncio
 import re
-from typing import Optional
+from typing import Literal, Optional
+
+import httpx
 
 from lxml import html as lxml_html
 
-from ..client import GoszakupClient, SessionExpired
+from ..client import GoszakupClient, SessionExpired, portal_auth_redirect
 
 STATUS_OPEN_FOR_BIDS = 210      # Опубликовано (приём заявок)
 STATUS_PUBLISHED = 220           # Опубликовано (приём ещё не открыт)
@@ -132,24 +135,41 @@ async def find_tenders(
     return out
 
 
-async def probe_cookie(gz: GoszakupClient) -> bool:
-    """Return True iff cookie is alive (cabinet page actually accessible).
+_PROFILE_PATH = re.compile(r"/(?:(?:ru|kz|en)/)?cabinet/profile/?")
+_LOGIN_USERNAME = re.compile(rb"<input\b[^>]*\bname\s*=\s*[\"']username[\"']", re.I)
 
-    Eng review M3: a naive `status==200` check can lie — goszakup
-    occasionally returns 200 for an unauth user with a login form rendered
-    inline. We follow redirects and verify (a) we didn't land at /login
-    and (b) the body doesn't carry login-form markers.
-    """
+
+async def probe_portal_session(
+    gz: GoszakupClient, *, timeout_s: float = 5.0,
+) -> Literal["active", "expired", "sso", "unavailable"]:
+    """Check cabinet access without following the SSO redirect or replacing cookies."""
+    base = httpx.URL(gz.base_url)
+    path = "/cabinet/profile"
     try:
-        r = await gz._http.get("/cabinet/profile", follow_redirects=True)
-    except Exception:
-        return False
-    final = str(r.url).lower()
-    if "/user/login" in final or "/login" in final:
-        return False
-    if r.status_code != 200:
-        return False
-    body = r.text[:8192].lower()
-    if "/user/login" in body and 'name="username"' in body:
-        return False
-    return True
+        async with asyncio.timeout(timeout_s):
+            for _ in range(3):
+                response = await gz.peek(path)
+                auth_redirect = portal_auth_redirect(response, base_url=gz.base_url)
+                if auth_redirect == "sso":
+                    return "sso"
+                if auth_redirect == "legacy" or response.status_code == 401:
+                    return "expired"
+                if response.status_code == 200:
+                    if b"/user/login" in response.content.lower() and _LOGIN_USERNAME.search(response.content):
+                        return "expired"
+                    return "active"
+                if not response.has_redirect_location:
+                    break
+                target = response.url.join(response.headers["location"])
+                if (target.userinfo
+                        or (target.scheme, target.host, target.port) != (base.scheme, base.host, base.port)
+                        or not _PROFILE_PATH.fullmatch(target.path)):
+                    break
+                path = target.raw_path.decode("ascii")
+    except (TimeoutError, httpx.HTTPError, httpx.InvalidURL):
+        pass
+    return "unavailable"
+
+
+async def probe_cookie(gz: GoszakupClient) -> bool:
+    return await probe_portal_session(gz) == "active"

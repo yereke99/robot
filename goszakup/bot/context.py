@@ -72,6 +72,7 @@ class BotContext:
     # submit_bid. ci_session() prefers this over re-reading from disk.
     _ci_session: Optional[str] = None
     _agreement_cookie: Optional[str] = None
+    portal_session_changed: asyncio.Event = field(default_factory=asyncio.Event, init=False)
 
     # Runtime-adjustable bid settings (seeded from config.yaml `defaults` at boot,
     # changed live via /config). In-memory for the process; config.yaml holds the
@@ -181,6 +182,13 @@ class BotContext:
 
     def set_ci_session(self, value: str) -> None:
         """Called after a successful login to update the in-memory cookie."""
-        self._ci_session = value
         if self.gz_client is not None:
             self.gz_client.adopt_ci_session(value)
+        self.last_cookie_probe = None
+        if value != self._ci_session:
+            self.invalidate_doc_pool()
+        self._ci_session = value
+        # A verified reinstall can repair a waiter even when the raw value matches.
+        previous_event = self.portal_session_changed
+        self.portal_session_changed = asyncio.Event()
+        previous_event.set()

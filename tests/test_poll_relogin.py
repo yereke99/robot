@@ -14,7 +14,7 @@ import types
 import pytest
 
 from goszakup import client
-from goszakup.client import GoszakupClient, SessionExpired
+from goszakup.client import GoszakupClient, PortalLoginRequired, SessionExpired
 
 
 def _resp(*, status: int, url: str, text: str = ""):
@@ -172,6 +172,109 @@ async def test_opening_poll_skips_not_found_but_follows_draft_redirects():
         assert create.call_count == 2
         assert draft.call_count == 1
         assert not_found.call_count == 0
+
+
+@pytest.mark.parametrize("intermediate", [False, True])
+async def test_opening_poll_identifies_sso_without_visiting_it(intermediate):
+    auth_url = "https://zakup.gov.kz/ru/user/login?state=diagnostic-secret"
+    create_path = "/ru/application/create/17905992"
+    bridge_path = "/ru/account/login_redirect"
+
+    async def legacy_relogin():
+        pytest.fail("Legacy ECP login must not run for a known SSO redirect")
+
+    async with respx.mock(assert_all_called=False) as router:
+        create = router.get(_BASE + create_path).respond(
+            302, headers={"Location": bridge_path if intermediate else auth_url},
+        )
+        bridge = router.get(_BASE + bridge_path).respond(302, headers={"Location": auth_url})
+        auth = router.get(auth_url).respond(200)
+        async with GoszakupClient(ci_session="dummy") as gz:
+            with pytest.raises(PortalLoginRequired) as exc:
+                await asyncio.wait_for(
+                    gz.poll_announce_ready("17905992", max_wait_s=600, relogin=legacy_relogin),
+                    timeout=2,
+                )
+        assert "https://zakup.gov.kz/" in str(exc.value)
+        assert "diagnostic-secret" not in str(exc.value)
+        assert create.call_count == 1
+        assert bridge.call_count == int(intermediate)
+        assert not auth.called
+
+
+async def test_opening_poll_reports_auth_migration_during_legacy_relogin():
+    auth_url = "https://zakup.gov.kz/"
+    async with respx.mock(assert_all_called=False) as router:
+        router.get(_BASE + "/ru/application/create/17905992").respond(
+            302, headers={"Location": "/ru/user/login"},
+        )
+        login = router.get(_BASE + "/ru/user/login").respond(
+            302, headers={"Location": auth_url, "Set-Cookie": "ci_session=anonymous; Path=/"},
+        )
+        nonce = router.post(_BASE + "/ru/user/sendkey/kz").respond(200)
+        password = router.post(_BASE + "/ru/user/auth_confirm").respond(200)
+        auth = router.get(auth_url).respond(200)
+        async with GoszakupClient(ci_session="stale") as gz:
+            async def try_legacy_login():
+                await gz.relogin_isolated(account_password="test", kalkan_signer=object())
+
+            with pytest.raises(PortalLoginRequired):
+                await asyncio.wait_for(
+                    gz.poll_announce_ready("17905992", max_wait_s=600, relogin=try_legacy_login),
+                    timeout=2,
+                )
+            assert gz.get_cookie("ci_session") == "stale"
+        assert login.call_count == 1
+        assert not auth.called
+        assert not nonce.called
+        assert not password.called
+
+
+@pytest.mark.parametrize("status", [200, 401])
+async def test_opening_poll_does_not_treat_explicit_expiry_as_an_unopened_tender(status):
+    form = '<form action="/ru/user/login"><input name="username"></form>'
+    async with respx.mock(base_url=_BASE) as router:
+        router.get("/ru/application/create/17905992").respond(status, html=form)
+        async with GoszakupClient(ci_session="stale") as gz:
+            with pytest.raises(SessionExpired) as exc:
+                await asyncio.wait_for(gz.poll_announce_ready("17905992", max_wait_s=600), timeout=2)
+        assert not isinstance(exc.value, PortalLoginRequired)
+
+
+async def test_login_does_not_follow_an_unrecognized_external_redirect():
+    foreign_url = "https://zakup.gov.kz.example.org/ru/user/login"
+    async with respx.mock(assert_all_called=False) as router:
+        router.get(_BASE + "/ru/user/login").respond(302, headers={"Location": foreign_url})
+        auth = router.get(foreign_url).respond(200)
+        nonce = router.post(_BASE + "/ru/user/sendkey/kz").respond(200)
+        async with GoszakupClient() as gz:
+            with pytest.raises(RuntimeError, match="неизвестный адрес") as exc:
+                await gz.login(account_password="test", kalkan_signer=object())
+        assert not isinstance(exc.value, PortalLoginRequired)
+        assert not auth.called
+        assert not nonce.called
+
+
+async def test_legacy_login_can_still_adopt_the_authenticated_session():
+    class Signer:
+        async def sign_xml(self, challenge):
+            assert "0123456789abcdef" in challenge
+            return "<signed>test</signed>"
+
+    async with respx.mock(base_url=_BASE) as router:
+        router.get("/ru/user/login").respond(200, html="<html>Login</html>")
+        router.post("/ru/user/sendkey/kz").respond(200, text="0123456789abcdef")
+        router.post("/user/sendsign/kz").respond(200)
+        router.get("/ru/user/auth_confirm").respond(200)
+        router.post("/ru/user/auth_confirm").respond(
+            302, headers={"Location": "/ru/cabinet/profile"},
+        )
+        router.get("/ru/cabinet/profile").respond(
+            200, headers={"Set-Cookie": "ci_session=authenticated; Path=/"},
+        )
+        async with GoszakupClient(ci_session="stale") as gz:
+            assert await gz.relogin_isolated(account_password="test", kalkan_signer=Signer()) == "authenticated"
+            assert gz.get_cookie("ci_session") == "authenticated"
 
 
 async def test_create_application_reuses_the_form_the_poll_fetched():

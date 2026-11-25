@@ -734,6 +734,7 @@ async def submit_bid(
     proxy: Optional[str] = None,
     gz_client: Optional[GoszakupClient] = None,
     on_open=None,
+    poll_ready=None,  # /schedule manages session health while waiting for the opening
 ) -> SubmissionState:
     # Each run is a fresh attempt (create_application makes a NEW app id), so
     # start clean — don't let a previous attempt's error/step/app_id bleed in
@@ -847,7 +848,9 @@ async def submit_bid(
             stack.push_async_callback(_cancel_task, warm_task)
 
         try:
-            if pre_t0_poll:
+            if poll_ready is not None:
+                await poll_ready()
+            elif pre_t0_poll:
                 await gz.poll_announce_ready(
                     params.announce_id, interval_s=poll_interval_s,
                     max_wait_s=getattr(params, "max_poll_wait_s", 1800.0),

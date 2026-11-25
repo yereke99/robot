@@ -52,6 +52,9 @@ from .timing import HttpTiming, current_trace
 log = structlog.get_logger("client")
 
 DEFAULT_BASE_URL = "https://v3bl.goszakup.gov.kz"
+PORTAL_LOGIN_URL = "https://zakup.gov.kz/"
+_REDIRECT_CODES = {301, 302, 303, 307, 308}
+_LOGIN_PATH = re.compile(r"/(?:[a-z]{2}/)?user/login(?:/.*)?", re.IGNORECASE)
 
 # Most creates in the timing reports take over two seconds. One opt-in read
 # near the end can pick up the draft if the portal commits before answering.
@@ -122,6 +125,76 @@ class SessionExpired(RuntimeError):
     catching it. Bot layer catches this specifically to trigger one
     auto-relogin and a retry.
     """
+
+
+class PortalLoginRequired(SessionExpired):
+    """The legacy portal delegated authentication to the official login site."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            f"Сессия Госзакупок истекла. Войдите на {PORTAL_LOGIN_URL} "
+            "и обновите сессию командой /cookie в личном чате с ботом."
+        )
+
+
+class _UnexpectedPortalRedirect(RuntimeError):
+    """A portal redirect to an unrecognized origin was not followed."""
+
+
+def _same_origin(url: httpx.URL, origin: httpx.URL) -> bool:
+    return (url.scheme, url.host, url.port) == (origin.scheme, origin.host, origin.port)
+
+
+def _portal_response_url(response, fallback: httpx.URL) -> httpx.URL:
+    try:
+        return httpx.URL(str(response.url))
+    except (AttributeError, RuntimeError, httpx.InvalidURL):
+        # Synthetic responses may lack the initiating request.
+        return fallback
+
+
+def _portal_redirect_target(response, source: httpx.URL) -> httpx.URL | None:
+    if response.status_code not in _REDIRECT_CODES:
+        return None
+    location = getattr(response, "headers", {}).get("location")
+    if not location:
+        return None
+    try:
+        return source.join(location)
+    except (TypeError, ValueError, httpx.InvalidURL):
+        return None
+
+
+def portal_auth_redirect(response, *, base_url: str) -> str | None:
+    """Recognize an auth destination without following a redirect.
+
+    Returns "sso" for the official login origin, "legacy" for a same-origin
+    /user/login, or None for normal workflow redirects and other destinations.
+    The final URL is also checked for callers that already followed a redirect.
+    """
+    origin = httpx.URL(base_url)
+    sso_origin = httpx.URL(PORTAL_LOGIN_URL)
+    source = _portal_response_url(response, origin)
+    target = _portal_redirect_target(response, source)
+    for url in (target, source):
+        if url is None or url.userinfo:
+            continue
+        if _same_origin(url, sso_origin) and not _same_origin(url, origin):
+            return "sso"
+        if _same_origin(url, origin) and _LOGIN_PATH.fullmatch(url.path):
+            return "legacy"
+    return None
+
+
+def _is_legacy_login_form(response) -> bool:
+    """Detect the explicit login form if the server sends it with a 200."""
+    ctype = getattr(response, "headers", {}).get("content-type", "").lower()
+    if response.status_code != 200 or "html" not in ctype:
+        return False
+    sample = response.content[:16_384].lower()
+    return b"/user/login" in sample and (
+        b'name="username"' in sample or b"name='username'" in sample
+    )
 
 
 class AlreadyPrepared(RuntimeError):
@@ -662,6 +735,54 @@ class GoszakupClient:
         val = self.get_cookie("csrf_cookie")
         return f"csrf={val}&" if val else ""
 
+    def _check_protected_response(self, response) -> None:
+        auth = portal_auth_redirect(response, base_url=self.base_url)
+        if auth == "sso":
+            raise PortalLoginRequired()
+        if auth == "legacy" or response.status_code == 401 or _is_legacy_login_form(response):
+            raise SessionExpired(
+                "Сессия Госзакупок больше не действительна. Обновите сессию бота."
+            )
+
+    def _check_legacy_login_origin(self, response: httpx.Response) -> httpx.URL | None:
+        """Stop the old ECP login before crossing an origin or attempting SSO."""
+        if portal_auth_redirect(response, base_url=self.base_url) == "sso":
+            raise PortalLoginRequired()
+        origin = httpx.URL(self.base_url)
+        target = _portal_redirect_target(response, _portal_response_url(response, origin))
+        if target is not None and (target.userinfo or not _same_origin(target, origin)):
+            raise _UnexpectedPortalRedirect(
+                "Портал Госзакупок перенаправил запрос на неизвестный адрес."
+            )
+        return target
+
+    async def _follow_portal_get_redirects(
+        self, response: httpx.Response, *,
+        skip_not_found: bool = False, legacy_login_page: bool = False,
+        allow_other_origins: bool = False,
+    ) -> httpx.Response:
+        """Follow GET redirects while checking every hop for login state."""
+        origin = httpx.URL(self.base_url)
+        for _ in range(getattr(self._http, "max_redirects", 20) + 1):
+            if legacy_login_page:
+                self._check_legacy_login_origin(response)
+            else:
+                self._check_protected_response(response)
+            next_request = getattr(response, "next_request", None)
+            if next_request is None:
+                return response
+            target = next_request.url
+            if target.userinfo or (not allow_other_origins and not _same_origin(target, origin)):
+                raise _UnexpectedPortalRedirect(
+                    "Портал Госзакупок перенаправил запрос на неизвестный адрес."
+                )
+            if skip_not_found and target.path.rstrip("/") in (
+                "/ru/error_report/not_found", "/kz/error_report/not_found", "/error_report/not_found",
+            ):
+                return response
+            response = await self._http.send(next_request, follow_redirects=False)
+        raise httpx.TooManyRedirects("Too many portal redirects")
+
     async def _post_form(
         self,
         path: str,
@@ -675,22 +796,9 @@ class GoszakupClient:
         r = await self._http.post(path, content=encoded, headers=_ajax_headers(referer))
         log.info("http.post.done", path=path, status=r.status_code, len=len(r.content))
 
-        # Session-expired detection. We don't follow redirects on POST
-        # (follow_redirects=False in the client) so a dead cookie shows up
-        # as a 30x with Location: /user/login... — without this check,
-        # downstream parsers read login HTML as JSON and emit cryptic
-        # "no file_id" / "no offer pairs" errors mid-bid.
-        loc = (r.headers.get("location") or "").lower()
-        if r.status_code in (301, 302, 303, 307, 308) and "/user/login" in loc:
-            raise SessionExpired(f"POST {path} -> {loc}")
-        # Rare: server returns 200 with the login HTML page (happens on some
-        # AJAX endpoints when CSRF/session is dead). Only flag if the body
-        # is HTML containing both /user/login and a login form marker.
-        ctype = (r.headers.get("content-type") or "").lower()
-        if r.status_code == 200 and "html" in ctype and len(r.content) > 1024:
-            sample = r.content[:2048].lower()
-            if b"/user/login" in sample and b"name=\"username\"" in sample:
-                raise SessionExpired(f"POST {path} returned login HTML (200)")
+        # POSTs remain non-following. Recognize auth redirects before
+        # a downstream application parser can mistake them for a normal reply.
+        self._check_protected_response(r)
         return r
 
     async def _get_page(self, path: str, *, follow_redirects: bool = True) -> str:
@@ -703,7 +811,13 @@ class GoszakupClient:
     async def _get_page_response(self, path: str, *, follow_redirects: bool = True) -> httpx.Response:
         """Fetch an HTML page and retain its final URL."""
         log.info("http.get", path=path)
-        r = await self._http.get(path, follow_redirects=follow_redirects)
+        r = await self._http.get(path, follow_redirects=False)
+        if follow_redirects:
+            # Preserve generic page navigation; callers validate the final
+            # origin before using the response as proof of a draft's state.
+            r = await self._follow_portal_get_redirects(r, allow_other_origins=True)
+        else:
+            self._check_protected_response(r)
         final_url = str(r.url)
         log.info(
             "http.get.done",
@@ -712,8 +826,6 @@ class GoszakupClient:
             final=final_url,
             len=len(r.content),
         )
-        if "/user/login" in final_url:
-            raise SessionExpired(f"GET {path} -> {final_url}")
         r.raise_for_status()
         return r
 
@@ -1703,7 +1815,8 @@ class GoszakupClient:
         # Step 0: GET the login page so the server issues csrf_cookie.
         # Also extract the hidden CSRF field name+value from the form — CI
         # checks that POST[csrf_field] == cookie[csrf_cookie].
-        r0 = await self._http.get("/ru/user/login")
+        r0 = await self._http.get("/ru/user/login", follow_redirects=False)
+        r0 = await self._follow_portal_get_redirects(r0, legacy_login_page=True)
         if r0.status_code not in (200, 302):
             log.warning("login.login_page.unexpected_status", status=r0.status_code)
         # The site uses <meta name="csrf-token-name"> / <meta name="csrf-token-hash">
@@ -1740,6 +1853,7 @@ class GoszakupClient:
                 "Sec-Fetch-Site": "same-origin",
             },
         )
+        self._check_legacy_login_origin(r1)
         if r1.status_code >= 400:
             log.error("login.sendkey.error", status=r1.status_code,
                       body=r1.text[:2000])
@@ -1783,6 +1897,7 @@ class GoszakupClient:
                 "Referer": f"{self.base_url}/ru/user/login",
             },
         )
+        self._check_legacy_login_origin(r3)
         if r3.status_code >= 400:
             log.error("login.sendsign.error", status=r3.status_code, body=r3.text[:500])
         r3.raise_for_status()
@@ -1793,6 +1908,7 @@ class GoszakupClient:
             "/ru/user/auth_confirm",
             headers={"Referer": f"{self.base_url}/ru/user/login"},
         )
+        self._check_legacy_login_origin(r4)
         # follow_redirects is False by default; tolerate either 200 or a 302
         if r4.status_code not in (200, 302):
             raise RuntimeError(f"auth_confirm GET failed: {r4.status_code}")
@@ -1814,12 +1930,16 @@ class GoszakupClient:
             data=_with_csrf({"password": account_password, "agreed_check": "on"}),
             headers={"Referer": f"{self.base_url}/ru/user/auth_confirm"},
         )
-        loc = r5.headers.get("location", "")
-        if r5.status_code != 302 or "/user/login" in loc or "error" in loc:
+        target = self._check_legacy_login_origin(r5)
+        target_path = target.path if target is not None else ""
+        if (
+            r5.status_code != 302 or _LOGIN_PATH.fullmatch(target_path)
+            or "error" in target_path
+        ):
             err_detail = ""
-            if loc:
+            if target is not None:
                 try:
-                    r_err = await self._http.get(loc)
+                    r_err = await self._http.get(target, follow_redirects=False)
                     alerts = re.findall(r'<div[^>]*class="[^"]*(?:alert|error|message)[^"]*"[^>]*>(.*?)</div>', r_err.text, re.DOTALL | re.IGNORECASE)
                     if alerts:
                         from lxml import html as _html
@@ -1827,23 +1947,19 @@ class GoszakupClient:
                 except Exception:
                     pass
             raise RuntimeError(
-                f"login failed at password step: status={r5.status_code} loc={loc!r} "
+                f"login failed at password step: status={r5.status_code} path={target_path!r} "
                 f"причина: {err_detail or 'неверный пароль от личного кабинета'}"
             )
-        log.info("login.success.redirect", to=loc)
+        log.info("login.success.redirect", path=target_path)
 
         # Step 6: follow the redirect to /cabinet/profile. PHP regenerates the
         # session ID on first authenticated GET, so without this hop we'd be
         # left with the pre-auth ci_session that the server won't honour for
         # /announce/* endpoints.
-        cabinet_path = loc.replace(self.base_url, "") or "/ru/cabinet/profile"
-        r6 = await self._http.get(cabinet_path, follow_redirects=True)
-        log.info("login.cabinet", status=r6.status_code, final=str(r6.url))
-
-        # Dump all cookies for visibility (values truncated).
-        all_cookies = {k: (v[:30] + "...") if len(v) > 30 else v
-                       for k, v in self._http.cookies.items()}
-        log.info("login.cookies", cookies=all_cookies)
+        r6 = await self._http.get(target or "/ru/cabinet/profile", follow_redirects=False)
+        r6 = await self._follow_portal_get_redirects(r6)
+        r6.raise_for_status()
+        log.info("login.cabinet", status=r6.status_code, final=r6.url.path)
 
         ci = self.get_cookie("ci_session")
         if not ci:
@@ -1884,11 +2000,9 @@ class GoszakupClient:
     def _classify_create_poll(self, r, final_url: str, announce_id: str):
         """One create-page probe -> (verdict, matched_marker).
 
-        verdict: ready | existing_draft | not_open | login_expired | access_denied | no_form
+        verdict: ready | existing_draft | not_open | access_denied | no_form
         """
-        if "/user/login" in final_url:
-            return "login_expired", None
-        if "access_denied" in final_url:
+        if r.status_code == 403 or "access_denied" in final_url:
             # Genuine ineligibility (tariff/agreement) — never clears by waiting.
             return "access_denied", None
         # Server bounced us straight to a draft (any post-create stage for
@@ -1926,7 +2040,8 @@ class GoszakupClient:
 
         A redirect to the portal's not-found page means there is no form yet.
         Skip loading that error page so its GET cannot occupy an opening-probe
-        slot. Follow other redirects for login, eligibility and existing drafts.
+        slot. Follow same-origin redirects for eligibility and existing drafts.
+        Recognize authorization redirects without opening the login site.
         The first probe to see the form or a draft wins and the rest are cancelled.
 
         ``relogin``: optional async callback. The cabinet ci_session lives only
@@ -1937,6 +2052,7 @@ class GoszakupClient:
         for the tender to open. Guarded so exactly one relogin runs at a time
         and a fresh cookie gets a chance before we try again. Without a callback
         (manual ci_session, no stored creds) we raise SessionExpired as before.
+        A redirect to the official login site raises PortalLoginRequired immediately.
         """
         import asyncio
 
@@ -1948,7 +2064,12 @@ class GoszakupClient:
         inflight: set = set()
         seq = 0
         relogin_lock = asyncio.Lock()
-        relogin_at = 0.0                          # loop time of last successful relogin
+        relogin_at = float("-inf")                # loop time of last successful relogin
+
+        def _fail(error: Exception) -> None:
+            if not done.is_set():
+                outcome["error"] = error
+                done.set()
 
         async def _relogin_once(n: int) -> None:
             nonlocal relogin_at
@@ -1962,26 +2083,39 @@ class GoszakupClient:
                 log.warning("poll.session_expired.relogin", attempt=n)
                 try:
                     await relogin()
-                except Exception as e:            # noqa: BLE001 — couldn't recover; bail
-                    log.error("poll.relogin.failed", attempt=n, err=str(e))
-                    if "error" not in outcome:
-                        outcome["error"] = SessionExpired(
-                            f"poll relogin failed: {e}")
-                        done.set()
+                except PortalLoginRequired as e:
+                    log.warning("poll.relogin.interactive_required", attempt=n)
+                    _fail(e)
+                    return
+                except Exception as e:
+                    log.error("poll.relogin.failed", attempt=n, error_type=type(e).__name__)
+                    _fail(SessionExpired(
+                        "Не удалось обновить сессию Госзакупок автоматически. "
+                        "Обновите сессию бота."))
                     return
                 relogin_at = loop.time()
                 log.info("poll.relogin.ok", attempt=n)
 
         async def _probe(n: int) -> None:
+            started_after_relogin = relogin_at
             try:
                 r = await self._http.get(path, follow_redirects=False)
-                if r.next_request is not None:
-                    target = r.next_request.url
-                    if target.host == httpx.URL(self.base_url).host and target.path.rstrip("/") in (
-                        "/ru/error_report/not_found", "/kz/error_report/not_found", "/error_report/not_found",
-                    ):
-                        return
-                    r = await self._http.send(r.next_request, follow_redirects=True)
+                r = await self._follow_portal_get_redirects(r, skip_not_found=True)
+            except PortalLoginRequired as e:
+                if started_after_relogin == relogin_at:
+                    log.warning("poll.session_expired.interactive_required", attempt=n)
+                    _fail(e)
+                return
+            except SessionExpired as e:
+                if started_after_relogin == relogin_at and not done.is_set():
+                    if relogin is not None:
+                        await _relogin_once(n)
+                    else:
+                        _fail(e)
+                return
+            except _UnexpectedPortalRedirect as e:
+                _fail(e)
+                return
             except Exception as e:                # one flaky probe -> let cadence retry
                 log.debug("poll.probe.error", attempt=n, err=str(e))
                 return
@@ -1990,20 +2124,11 @@ class GoszakupClient:
             if n == 1 or verdict not in ("not_open",):
                 log.info("poll.tick", attempt=n, status=r.status_code,
                          final=final_url, body_len=len(r.content), verdict=verdict)
-            if verdict == "login_expired":
-                if relogin is not None:
-                    await _relogin_once(n)        # refresh the session, keep polling
-                elif "error" not in outcome:
-                    outcome["error"] = SessionExpired(
-                        "poll redirected to /user/login: ci_session expired. "
-                        "Run `submit.py login` to refresh.")
-                    done.set()
-            elif verdict == "access_denied" and "error" not in outcome:
-                outcome["error"] = RuntimeError(
+            if verdict == "access_denied":
+                _fail(RuntimeError(
                     f"poll → {final_url}: account isn't eligible to bid. "
-                    "Check tariff status and agreement signing.")
-                done.set()
-            elif verdict in ("ready", "existing_draft") and not outcome.get("ready"):
+                    "Check tariff status and agreement signing."))
+            elif verdict in ("ready", "existing_draft") and not done.is_set():
                 log.info("poll.ready", attempt=n, final=final_url, matched=matched)
                 if verdict == "ready":
                     # Hand the open create form to create_application (saves
