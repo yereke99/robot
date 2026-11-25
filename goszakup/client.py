@@ -793,22 +793,34 @@ class GoszakupClient:
             if watch is not None:
                 await watch.aclose()
 
-    async def _create_application(
-        self, announce_id: str, *, cur_addr: str, cur_iik: str, valid_iiks: list[str],
-        contact_phone: str, tax_payer_type: str, consortium: int,
-        watch: Optional[_EarlyApplicationId],
-    ) -> Optional[str]:
-        r = await self._post_form(
+    async def post_create_application(
+        self, announce_id: str, *, subject_address: str, iik: str, contact_phone: str = "",
+        tax_payer_type: str = "UL", consortium: int = 0,
+    ) -> httpx.Response:
+        """The bare ajax_create_application POST: exactly one request, the raw
+        answer, no reading of the form before it and no discovery after it.
+        (create_application() is built on it; tools/probe_preopen.py uses it to
+        see what the portal answers before a tender opens.)"""
+        return await self._post_form(
             f"/ru/application/ajax_create_application/{announce_id}",
             {
-                "subject_address": cur_addr,
-                "iik": cur_iik,
+                "subject_address": subject_address,
+                "iik": iik,
                 "contact_phone": contact_phone,
                 "tax_payer_type": tax_payer_type,
                 "consortium": consortium,
             },
             referer_path=f"/ru/application/create/{announce_id}",
         )
+
+    async def _create_application(
+        self, announce_id: str, *, cur_addr: str, cur_iik: str, valid_iiks: list[str],
+        contact_phone: str, tax_payer_type: str, consortium: int,
+        watch: Optional[_EarlyApplicationId],
+    ) -> Optional[str]:
+        r = await self.post_create_application(
+            announce_id, subject_address=cur_addr, iik=cur_iik, contact_phone=contact_phone,
+            tax_payer_type=tax_payer_type, consortium=consortium)
         log.info(
             "create_application.response",
             status=r.status_code,
@@ -829,17 +841,10 @@ class GoszakupClient:
                         if alt_iik == cur_iik:
                             continue
                         log.info("create_application.retrying_alt_iik", alt_iik=alt_iik)
-                        r2 = await self._post_form(
-                            f"/ru/application/ajax_create_application/{announce_id}",
-                            {
-                                "subject_address": cur_addr,
-                                "iik": alt_iik,
-                                "contact_phone": contact_phone,
-                                "tax_payer_type": tax_payer_type,
-                                "consortium": consortium,
-                            },
-                            referer_path=f"/ru/application/create/{announce_id}",
-                        )
+                        r2 = await self.post_create_application(
+                            announce_id, subject_address=cur_addr, iik=alt_iik,
+                            contact_phone=contact_phone, tax_payer_type=tax_payer_type,
+                            consortium=consortium)
                         j2 = r2.json()
                         if isinstance(j2, dict) and j2.get("status") not in ("error", "fail"):
                             app_id = self._extract_app_id_from_response(r2, announce_id)

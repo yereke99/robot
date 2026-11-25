@@ -194,6 +194,13 @@ Details, the route-by-route model and the next-report checklist:
   `lat` (per-route latencies, to replay a live trace), `listing`, `ts_names`,
   `ts_copy_differs`, `verify_signatures`, `stale_app`. The live trace is pinned
   as `test_replay_of_the_live_trace_17983518`.
+- Next lever: create by POST at the opening second instead of polling the
+  form (−1…−1.5 s of real time, invisible in the "from detection" metric). Not
+  built: it needs the portal's answer to a create POST BEFORE the opening.
+  `python -m tools.probe_preopen --post <announce>` sends exactly one such POST
+  (refuses unless the create page says "not open", reports any draft left
+  behind) — run by the operator; wait for that output before building it. The
+  opening time is on the announcement card to the second.
 - Dev note: this checkout's directories may be read-only (archive extraction);
   `chmod u+w` the directory before adding a file. `.venv` here is a Windows
   venv — run tests with a Python 3.11 environment of your own.
