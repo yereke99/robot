@@ -17,6 +17,7 @@ import uuid
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
+from ... import flow as flow_repairs
 from ..auth import whitelist_only
 
 log = logging.getLogger("settings")
@@ -34,7 +35,18 @@ SETTABLE: dict[str, tuple[str, str]] = {
     "confirm_before_submit": ("bool", "Спрашивать подтверждение в Telegram перед подачей"),
     "dumping_floor_ratio": ("float", "Доля для расчёта минимума, если портал его не передал (например 0.80)"),
     "dry_run": ("bool", "Тестовый режим: собрать заявку, но НЕ подавать"),
+    # Speed switches of the hot path (docs/PERFORMANCE_AUDIT.md). The two
+    # experiments are meant to be tried with dry_run on first.
+    "lot_save_parallel": ("bool", "ЭКСПЕРИМЕНТ: страницы техспецификации сохранять одновременно"),
+    "gamma_parallel_saves": ("bool", "ЭКСПЕРИМЕНТ: подпись цены отправлять вместе с add_encrypt"),
+    "lot_barrier": ("barrier", "Контрольное чтение после техспецификации: each | last | none"),
+    "hedged_reads": ("bool", "Читать следующую страницу, пока портал ещё обрабатывает шаг"),
+    "presign_tech_spec": ("bool", "Подписывать файлы техспецификации до открытия тендера"),
 }
+
+# The runtime-editable subset of flow.speed_options().
+SPEED_KEYS = ("lot_save_parallel", "gamma_parallel_saves", "lot_barrier",
+              "hedged_reads", "presign_tech_spec")
 
 # Defaults used if config.yaml `defaults` omits a key.
 # confirm_before_submit is OFF by default: at T0 every second counts, so the
@@ -60,7 +72,19 @@ def seed_settings(raw_config: dict) -> dict:
     out["confirm_before_submit"] = bool(out["confirm_before_submit"])
     out["dumping_floor_ratio"] = float(out["dumping_floor_ratio"])
     out["dry_run"] = bool(out["dry_run"])
+    # speed switches: exactly what a bid would use with this config.yaml
+    effective = flow_repairs.speed_options(d)
+    out.update({k: effective[k] for k in SPEED_KEYS})
     return out
+
+
+def speed_defaults(ctx) -> dict:
+    """config.yaml ``defaults`` with the speed switches set via /config on top —
+    the argument for flow.speed_options() of a bid started now."""
+    merged = dict((ctx.config.raw or {}).get("defaults", {}) or {})
+    live = getattr(ctx, "bid_settings", None) or {}
+    merged.update({k: live[k] for k in SPEED_KEYS if k in live})
+    return merged
 
 
 def _coerce(typ: str, raw: str):
@@ -70,6 +94,11 @@ def _coerce(typ: str, raw: str):
         return float(raw.replace(",", "."))
     if typ == "bool":
         return raw.strip().lower() in ("1", "true", "on", "yes", "да", "вкл")
+    if typ == "barrier":
+        value = raw.strip().lower()
+        if value not in ("each", "last", "none"):
+            raise ValueError(raw)
+        return value
     return raw
 
 
@@ -118,6 +147,10 @@ async def config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if key == "guarantee_type" and int(val) != 3:
         note = ("\n⚠️ Нестандартный тип: бот отправит только выбор typeDoc, "
                 "но загрузку файла (напр. банковской гарантии) он пока не делает.")
+    if key in ("lot_save_parallel", "gamma_parallel_saves") and val:
+        note = ("\n⚠️ Эксперимент: сначала проверь на тестовой подаче "
+                "(<code>/config dry_run on</code>). Действует до перезапуска бота; "
+                "чтобы оставить — пропиши в config.yaml → defaults.")
     await update.message.reply_text(f"✅ <code>{key}</code> = <b>{val}</b>{note}", parse_mode="HTML")
 
 

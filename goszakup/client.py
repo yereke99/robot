@@ -34,6 +34,7 @@ isn't on the hot path and reversing the ECP login challenge is Phase 2 work.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import ssl
 import time
@@ -45,11 +46,64 @@ import httpx
 import structlog
 
 from . import timing
+from .hedge import HedgedRead, first_of
 from .timing import HttpTiming, current_trace
 
 log = structlog.get_logger("client")
 
 DEFAULT_BASE_URL = "https://v3bl.goszakup.gov.kz"
+
+# Reads of the draft's id that overlap ajax_create_application (see
+# _EarlyApplicationId). The create POST takes 2.6-2.8 s at T0; the read that
+# used to follow it took another 0.7-1.5 s.
+_EARLY_ID_FIRST_DELAY_S = 0.5
+_EARLY_ID_INTERVAL_S = 0.45
+_EARLY_ID_MAX_INFLIGHT = 3
+_EARLY_ID_MAX_TOTAL = 7
+
+_SHAPE_KEY = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,15}")
+_SHAPE_WORD = re.compile(r"[A-Za-z_]{1,12}")
+
+
+def reply_shape(response) -> str:
+    """Text-free outline of a small AJAX reply for the bid report.
+
+    ``status-ok``, ``status-0.message``, ``http302``, ``html``. Only key names
+    and short codes are kept — never free text, ids or tokens — so the exact
+    success/failure form of an endpoint can be read from a report without the
+    body ever leaving the host.
+    """
+    status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int) and status_code >= 300:
+        return f"http{status_code}"
+    text = getattr(response, "text", None)
+    if not isinstance(text, str):
+        return "unknown"
+    try:
+        body = json.loads(text)
+    except ValueError:  # HTML, empty or truncated body
+        text = text.lstrip()
+        return "html" if text.startswith("<") else ("text" if text else "empty")
+    if isinstance(body, list):
+        return f"list{min(len(body), 999)}"
+    if not isinstance(body, dict):
+        return "scalar"
+    parts = []
+    for key, value in list(body.items())[:6]:
+        if not isinstance(key, str) or not _SHAPE_KEY.fullmatch(key):
+            parts.append("key")
+            continue
+        if isinstance(value, bool):
+            parts.append(f"{key}-{str(value).lower()}")
+        elif isinstance(value, int) and -9 <= value <= 99:
+            parts.append(f"{key}-{value}")
+        elif isinstance(value, str) and _SHAPE_WORD.fullmatch(value):
+            parts.append(f"{key}-{value}")
+        elif isinstance(value, str) and re.fullmatch(r"-?[0-9]{1,2}", value):
+            parts.append(f"{key}-{value}")
+        else:
+            parts.append(key)
+    return ".".join(parts)[:40] or "empty"
 
 
 def _ajax_headers(referer: str) -> dict[str, str]:
@@ -213,6 +267,78 @@ class _TimedTransport(httpx.AsyncHTTPTransport):
         return response
 
 
+class _EarlyApplicationId:
+    """Learn the new draft's id while ajax_create_application is in flight.
+
+    The create POST answers ``{"status":"ok"}`` with no id, so the id used to
+    cost one more page read after it. Here the same read is repeated while the
+    POST is still running (HedgedRead); as soon as the portal has stored the
+    draft, a probe returns its id.
+
+    A draft that was ALREADY visible when the POST was sent would look exactly
+    like the new one, so the first read ("baseline", sent together with the
+    POST) decides whether early ids can be trusted at all: only if it showed no
+    draft does a later id count. Otherwise the usual read after the POST's
+    answer is used, as before. Nothing is written on the strength of an early
+    id until the create POST itself has answered without an error.
+    """
+
+    def __init__(self, client: "GoszakupClient", announce_id: str):
+        self._client = client
+        self._announce_id = str(announce_id)
+        self._baseline: Optional[asyncio.Task] = None
+        self._hedge: Optional[HedgedRead] = None
+        self.ambiguous = False
+
+    def start(self) -> None:
+        loop = asyncio.get_running_loop()
+        self._baseline = loop.create_task(self._client._read_application_id(self._announce_id))
+        self._hedge = HedgedRead(
+            self._probe, first_delay_s=_EARLY_ID_FIRST_DELAY_S, interval_s=_EARLY_ID_INTERVAL_S,
+            max_inflight=_EARLY_ID_MAX_INFLIGHT, max_total=_EARLY_ID_MAX_TOTAL, label="app_id",
+        ).start()
+
+    async def _probe(self, attempt: int) -> Optional[str]:
+        answered, app_id = await self._client._read_application_id(self._announce_id)
+        if not answered or not app_id:
+            return None
+        clean, seen_before = await asyncio.shield(self._baseline)
+        if not clean or seen_before:
+            self.ambiguous = True
+            self._hedge.stop()
+            return None
+        return app_id
+
+    async def resolve(self, usual) -> Optional[str]:
+        """The id for a create POST that answered without one."""
+        hedge = self._hedge
+        hedge.stop()
+        early = hedge.hit
+        if early is not None and not self.ambiguous:
+            lead = asyncio.get_running_loop().time() - (hedge.hit_at or 0.0)
+            log.info("create_application.early_id", ok=True, lead_s=round(lead, 3), n=hedge.launched)
+            return early
+        if self.ambiguous:
+            log.info("create_application.early_id", ok=False, verdict="draft_seen_before_create")
+            return await usual()
+        # No probe has answered with an id yet: start the usual read now and
+        # take whichever names the draft first. (A probe only ever returns an
+        # id that passed the baseline rule above.)
+        app_id, from_probe = await first_of(hedge.first(), usual)
+        log.info("create_application.early_id", ok=bool(from_probe), lead_s=0.0, n=hedge.launched)
+        return app_id
+
+    async def aclose(self) -> None:
+        if self._hedge is not None:
+            await self._hedge.aclose()
+        baseline = self._baseline
+        if baseline is not None and not baseline.done():
+            baseline.cancel()
+            await asyncio.gather(baseline, return_exceptions=True)
+        elif baseline is not None and not baseline.cancelled():
+            baseline.exception()
+
+
 class GoszakupClient:
     """Async HTTPS client for one submission run."""
 
@@ -284,8 +410,12 @@ class GoszakupClient:
             http2=(proxy is None),
             # The bot heartbeat runs every 30s. httpx's default 5s expiry
             # discarded that warmed connection before the next heartbeat/bid.
+            # The portal speaks HTTP/1.1 only, so every overlapping request is
+            # its own connection. Reads that overlap a stage POST (hedge.py)
+            # peak at ~8 on this client; leave headroom so the request the bid
+            # is actually waiting for never queues behind a probe.
             limits=httpx.Limits(
-                max_keepalive_connections=4, max_connections=8,
+                max_keepalive_connections=4, max_connections=12,
                 keepalive_expiry=60.0,
             ),
             proxy=proxy,
@@ -473,6 +603,36 @@ class GoszakupClient:
             log.debug("warm_connection.failed", err=str(e)[:120])
             return False
 
+    async def peek(self, path: str) -> httpx.Response:
+        """A GET that can neither change nor replace the cabinet session.
+
+        For reads that overlap a write on this client (hedge.py). Two rules:
+
+          * It is flagged as an AJAX call. CodeIgniter never regenerates the
+            session id on those, so a probe cannot be the request that rotates
+            the session while other requests still carry the old id.
+          * It goes straight through the transport: the jar's cookies are sent,
+            but no Set-Cookie of the answer is stored. A probe that the portal
+            treated as anonymous is answered with a fresh anonymous
+            ``ci_session`` — stored, that would replace the live one.
+
+        Redirects are not followed; the body is read in full.
+        """
+        request = self._http.build_request("GET", path, headers={
+            "Accept": "text/html, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        })
+        response = await self._transport.handle_async_request(request)
+        response.request = request
+        try:
+            await response.aread()
+        finally:
+            await response.aclose()
+        return response
+
     async def relogin_isolated(self, *, account_password: str, kalkan_signer) -> str:
         """Re-authenticate on a throwaway client, then adopt the fresh ci_session.
 
@@ -571,9 +731,13 @@ class GoszakupClient:
         contact_phone: str = "",
         tax_payer_type: str = "UL",
         consortium: int = 0,
+        early_id: bool = False,
     ) -> Optional[str]:
         """POST ajax_create_application. Automatically validates and picks real
         subject_address and iik from the create form if config is outdated or mismatched.
+
+        ``early_id``: read the draft's id while the POST is still in flight
+        (see _EarlyApplicationId) instead of only after its answer.
         """
         async def _fetch_valid_options() -> tuple[list[str], list[str]]:
             try:
@@ -615,6 +779,25 @@ class GoszakupClient:
             log.info("create_application.auto_pick_iik", old=cur_iik, new=valid_iiks[0], all=valid_iiks)
             cur_iik = valid_iiks[0]
 
+        watch: Optional[_EarlyApplicationId] = None
+        if early_id:
+            watch = _EarlyApplicationId(self, announce_id)
+            watch.start()
+        try:
+            return await self._create_application(
+                announce_id, cur_addr=cur_addr, cur_iik=cur_iik, valid_iiks=valid_iiks,
+                contact_phone=contact_phone, tax_payer_type=tax_payer_type,
+                consortium=consortium, watch=watch,
+            )
+        finally:
+            if watch is not None:
+                await watch.aclose()
+
+    async def _create_application(
+        self, announce_id: str, *, cur_addr: str, cur_iik: str, valid_iiks: list[str],
+        contact_phone: str, tax_payer_type: str, consortium: int,
+        watch: Optional[_EarlyApplicationId],
+    ) -> Optional[str]:
         r = await self._post_form(
             f"/ru/application/ajax_create_application/{announce_id}",
             {
@@ -632,6 +815,7 @@ class GoszakupClient:
             location=r.headers.get("location"),
             ctype=r.headers.get("content-type"),
             body=r.text[:500],
+            reply=reply_shape(r),
         )
 
         # Surface server-side errors
@@ -673,7 +857,33 @@ class GoszakupClient:
 
         # Fallback: GET lots page, follow redirects, parse final URL.
         log.info("create_application.discover_id", status=r.status_code)
+        if watch is not None:
+            return await watch.resolve(lambda: self._discover_application_id(announce_id))
         return await self._discover_application_id(announce_id)
+
+    async def _read_application_id(self, announce_id: str) -> tuple[bool, Optional[str]]:
+        """One read of this tender's applicant "lots" page, redirects not followed.
+
+        Returns ``(clean, app_id)``. ``clean`` is False when the answer cannot be
+        read as "this draft" or "no draft" (network error, an error status, or a
+        page naming several drafts). Never raises.
+        """
+        announce_id = str(announce_id)
+        try:
+            r = await self.peek(f"/ru/application/lots/{announce_id}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — a probe; the usual read still runs
+            log.debug("create_application.early_id_read_failed", error_type=type(exc).__name__)
+            return False, None
+        if r.status_code in (301, 302, 303, 307, 308):
+            return True, self._app_id_from_target(r.headers.get("location") or "", announce_id)
+        if r.status_code != 200:
+            return False, None
+        ids = set(re.findall(rf"/application/[a-z_]+/{re.escape(announce_id)}/(\d+)", r.text))
+        if len(ids) > 1:
+            return False, None
+        return True, (ids.pop() if ids else None)
 
     def _extract_app_id_from_response(
         self, r: httpx.Response, announce_id: str
@@ -795,7 +1005,8 @@ class GoszakupClient:
         )
         # body logged on purpose: if it carries the app_lot ids, the separate
         # GET that discovers them (one round-trip at T0) can go.
-        log.info("add_lots", lots=list(lot_ids), status=r.status_code, body=r.text[:400])
+        log.info("add_lots", lots=list(lot_ids), status=r.status_code, body=r.text[:400],
+                 len=len(r.content), reply=reply_shape(r))
         return r
 
     async def lots_next(self, announce_id: str, app_id: str, *, confirmed: int = 0) -> httpx.Response:
@@ -805,7 +1016,7 @@ class GoszakupClient:
             referer_path=f"/ru/application/lots/{announce_id}/{app_id}",
         )
         log.info("lots_next.response", status=r.status_code,
-                 location=r.headers.get("location"), body=r.text[:400])
+                 location=r.headers.get("location"), body=r.text[:400], reply=reply_shape(r))
         return r
 
     # ---------- step 4-5: doc signing ----------
@@ -1264,7 +1475,7 @@ class GoszakupClient:
                 f"{self.base_url}/ru/application/priceoffers/{announce_id}/{app_id}"
             ),
         )
-        log.info("add_encrypt", item_id=item_id, status=r.status_code)
+        log.info("add_encrypt", item_id=item_id, status=r.status_code, reply=reply_shape(r))
         return r
 
     async def save_gamma_signs(
@@ -1290,7 +1501,8 @@ class GoszakupClient:
                 f"{self.base_url}/ru/application/priceoffers/{announce_id}/{app_id}"
             ),
         )
-        log.info("save_gamma_signs", lps=list(signs_by_lp), status=r.status_code)
+        log.info("save_gamma_signs", lps=list(signs_by_lp), status=r.status_code,
+                 reply=reply_shape(r))
         return r
 
     async def priceoffers_next_gamma(
@@ -1319,7 +1531,8 @@ class GoszakupClient:
                 f"{self.base_url}/ru/application/priceoffers/{announce_id}/{app_id}"
             ),
         )
-        log.info("priceoffers_next_gamma", n=len(prices), status=r.status_code)
+        log.info("priceoffers_next_gamma", n=len(prices), status=r.status_code,
+                 reply=reply_shape(r))
         return r
 
     # ---------- step 11-15: docs_next + price offer + public ----------
@@ -1427,6 +1640,7 @@ class GoszakupClient:
             },
             referer_path=f"/ru/application/preview/{announce_id}/{app_id}",
         )
+        log.info("public_application.response", status=r.status_code, reply=reply_shape(r))
         try:
             return r.json()
         except Exception:

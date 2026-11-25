@@ -41,6 +41,7 @@ import re
 
 from ..auth import whitelist_only
 from ..context import BidQueueItem, BotContext
+from . import settings as settings_handler
 from ..progress import ProgressMessage, current_progress
 from ..search import probe_cookie
 from ..texts import BID_QUEUE_YOUR_TURN, BUSY_QUEUE, CANCELLED
@@ -791,7 +792,7 @@ async def _run_pipeline(
                 tumar_ws_url=raw_tumarcsp.get("ws_url", "wss://127.0.0.1:6127/tumarcsp/"),
                 autofill_price_popup=raw_tumarcsp.get("autofill_popup", False),
                 popup_coords=raw_tumarcsp.get("popup"),
-                **flow_repairs.speed_options(defaults),
+                **flow_repairs.speed_options(settings_handler.speed_defaults(ctx)),
             )
             # Account-scoped session clones (not tender-scoped).
             fresh_pool = ctx.get_doc_pool_if_fresh(announce_id)

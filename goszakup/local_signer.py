@@ -331,6 +331,47 @@ class LocalSigner:
         if not task.cancelled():
             task.exception()
 
+    # ---- pieces of sign_file, usable on their own (see goszakup/presign.py) ----
+
+    @property
+    def kalkan(self):
+        """The underlying signer, to build another LocalSigner on a sibling client."""
+        return self._kalkan
+
+    def _cache_prefix(self) -> str:
+        return f"{getattr(self._kalkan, 'key_id', '') or 'key'}:"
+
+    def cached_signature(self, sig_cache: Optional[dict], cache_key: Optional[str]) -> Optional[str]:
+        """The signature sign_file would return for ``cache_key`` without a download."""
+        if sig_cache is None or not cache_key:
+            return None
+        return sig_cache.get(f"{self._cache_prefix()}{cache_key}")
+
+    def remember_signature(self, sig_cache: Optional[dict], cache_key: str, signature: str) -> None:
+        if sig_cache is not None and cache_key:
+            sig_cache[f"{self._cache_prefix()}{cache_key}"] = signature
+
+    async def sign_content(self, data: bytes, sig_cache: Optional[dict] = None) -> tuple[str, str]:
+        """``(sha256, signature)`` of these bytes, through the content cache."""
+        import hashlib
+        content_hash = hashlib.sha256(data).hexdigest()
+        content_key = f"{self._cache_prefix()}{content_hash}"
+        if sig_cache is not None and content_key in sig_cache:
+            return content_hash, sig_cache[content_key]
+        signature = await self._kalkan.sign_bytes(data)
+        if sig_cache is not None:
+            sig_cache[content_key] = signature
+        return content_hash, signature
+
+    async def fetch_bytes(self, download_url: str, *, referer: Optional[str] = None) -> bytes:
+        """Download a portal file with this signer's session (no signing)."""
+        url = download_url
+        if hasattr(self._http, "base_url") and str(self._http.base_url):
+            base = str(self._http.base_url).rstrip("/")
+            if url.startswith(base):
+                url = url[len(base):]
+        return await self._download_file(url, {"Referer": referer} if referer else {}, False)
+
     async def _get_file_suffix(
         self, url: str, headers: dict[str, str], offset: int, size: int, etag: str,
     ) -> bytes | None:

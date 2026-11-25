@@ -27,6 +27,8 @@ Flow (matches the captured HAR for announce 17049098):
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import hashlib
 import os
 import re
 import time
@@ -39,7 +41,10 @@ from typing import Awaitable, Callable, Optional, Sequence
 import httpx
 import structlog
 
-from .client import AlreadyAtPriceStage, AlreadyPrepared, FetchedPricePage, GoszakupClient, SessionExpired
+from . import presign as presign_files
+from .client import (AlreadyAtPriceStage, AlreadyPrepared, FetchedPricePage, GoszakupClient,
+                     SessionExpired, reply_shape)
+from .hedge import HedgedRead, first_of
 from .local_signer import KalkanSigner, LocalSigner
 from .parser import _dump, extract_download_targets, extract_prepared_doc_target
 from .pipeline import _extract_app_lot_mapping  # reuse temka's robust mapper
@@ -154,6 +159,33 @@ _SETTLE_POLLS_AFTER_RESAVE = 2
 _SETTLE_S_AFTER_RESAVE = 6.0
 # Hard cap on re-save rounds per docs_next loop (targeted first, then full).
 _MAX_RESAVES = 3
+
+
+# Reads that overlap a stage-changing POST (hedge.py). The portal answers a
+# stage-gated page with a redirect until the POST has committed, so a probe
+# costs it little; the caps keep one bid from adding more than a handful of
+# requests per stage.
+_STAGE_READ_INTERVAL_S = 0.35     # cadence of the app_lot probes during lots_next
+_STAGE_READ_MAX_TOTAL = 5
+_DOCS_LIST_FIRST_DELAY_S = 0.2    # the document list: fewer, it feeds one document
+_DOCS_LIST_INTERVAL_S = 0.45
+_DOCS_LIST_MAX_TOTAL = 3
+_PRICE_READ_FIRST_DELAY_S = 0.25  # after ajax_docs_next is sent
+_PRICE_READ_INTERVAL_S = 0.3
+_PRICE_READ_MAX_TOTAL = 3
+_PRICE_READ_ATTEMPTS = 3          # docs_next polls that get price-page probes
+
+# Pages read before the price stage, kept for one retrospective check: does any
+# of them already name the lot point ids (see _report_early_lp_ids)?
+_seen_pages: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "seen_pages", default=None)
+
+
+def _remember_page(source: str, text: Optional[str]) -> None:
+    pages = _seen_pages.get()
+    if (pages is not None and isinstance(text, str) and text
+            and source not in pages and len(pages) < 16):
+        pages[source] = text
 
 
 def _clock() -> float:
@@ -406,6 +438,19 @@ class AtagosBidParams:
     # the add_encrypt answer is in, so the worst case is the old order plus one
     # repeated POST. EXPERIMENTAL.
     gamma_parallel_saves: bool = False
+    # ── Speed switches (docs/PERFORMANCE_AUDIT.md, "Трасса #17983518") ──
+    # Repeat the READ that follows a stage-changing POST while that POST is
+    # still in flight (hedge.py): the draft's id during create, the app_lot map
+    # and the document list during lots_next, the price page during docs_next.
+    # Reads only — every write keeps its place. A portal that serves the page
+    # only after the POST has answered makes the probes miss and costs nothing
+    # but those requests. False = one read after each POST, as before.
+    hedged_reads: bool = True
+    # Sign the tender's own тех.спец files from the announcement's public file
+    # list while waiting for the opening (presign.py). The application's copies
+    # are then committed without waiting for their download; each copy is still
+    # downloaded and compared by sha256 before docs_next.
+    presign_tech_spec: bool = True
     planned_price_ratio: Optional[float] = None
 
 
@@ -426,6 +471,8 @@ def speed_options(defaults) -> dict:
         "early_app_lots": _config_flag(d.get("early_app_lots"), True),
         "lot_save_parallel": _config_flag(d.get("lot_save_parallel"), False),
         "gamma_parallel_saves": _config_flag(d.get("gamma_parallel_saves"), False),
+        "hedged_reads": _config_flag(d.get("hedged_reads"), True),
+        "presign_tech_spec": _config_flag(d.get("presign_tech_spec"), True),
     }
 
 
@@ -539,7 +586,8 @@ def _docs_named_in_reject(msg: Optional[str], plan: Sequence["DocSpec"],
     return out
 
 
-async def _docs_next_until_accepted(gz, ann, app_id, *, on_reject=None) -> tuple[str, bool, Optional[str]]:
+async def _docs_next_until_accepted(gz, ann, app_id, *, on_reject=None,
+                                    watch=None) -> tuple[str, bool, Optional[str]]:
     """POST docs_next, polling until the server confirms every doc is accepted.
 
     The server answers "Подпишите … Приложение N" for two very different reasons,
@@ -563,6 +611,9 @@ async def _docs_next_until_accepted(gz, ann, app_id, *, on_reject=None) -> tuple
 
     A clean bid accepts on attempt 1 and never enters any of this.
     Returns (last_body, accepted, last_message).
+
+    ``watch`` (_PricePageWatch): reads the price page while each of the first
+    polls is in flight, so an accepted poll can hand the page over at once.
     """
     import json as _json
 
@@ -577,6 +628,8 @@ async def _docs_next_until_accepted(gz, ann, app_id, *, on_reject=None) -> tuple
     while True:
         attempt += 1
         poll_started = _clock()
+        if watch is not None:
+            watch.poll_started()
         dn = await gz.docs_next(ann, app_id)
         poll_duration = _clock() - poll_started
         body = dn.text
@@ -587,9 +640,13 @@ async def _docs_next_until_accepted(gz, ann, app_id, *, on_reject=None) -> tuple
         accepted = isinstance(dj, dict) and str(dj.get("status")) in ("1", "ok")
         msg = dj.get("message") if isinstance(dj, dict) else None
         log.info("flow.docs_next", attempt=attempt, status=dn.status_code,
-                 len=len(body), accepted=accepted, body=body[:300])
+                 len=len(body), accepted=accepted, body=body[:300], reply=reply_shape(dn))
         if accepted:
+            if watch is not None:
+                watch.poll_accepted()
             return body, True, msg
+        if watch is not None:
+            await watch.poll_rejected()
         waited = _clock() - started
         if attempt >= _DOCS_NEXT_MAX_TRIES or (
                 attempt >= _DOCS_NEXT_TRIES and waited >= _DOCS_NEXT_MAX_WAIT_S):
@@ -746,6 +803,23 @@ async def submit_bid(
                     kalkan_signer=ns,
                 )
 
+        # Pages read before the price stage (diagnostics, see _report_early_lp_ids).
+        # Set before any task is created so they all share this one dict.
+        stack.callback(_seen_pages.reset, _seen_pages.set({}))
+
+        # The tender's own тех.спец files are public long before the opening:
+        # download and sign them NOW, in the background, so that after T0 their
+        # copies in the application can be committed without a download first.
+        tender_files: Optional[presign_files.TenderFiles] = None
+        lot_doc_id = next((s.doc_id for s in params.doc_plan if s.kind == "lot_sign"), None)
+        if (params.presign_tech_spec and not params.resume_app_id and lot_doc_id is not None
+                and isinstance(gz, GoszakupClient)):
+            tender_files = presign_files.TenderFiles()
+            presign_task = asyncio.create_task(
+                _presign_tech_spec(gz, ns, params, lot_doc_id, tz_sig_cache, tender_files))
+            stack.push_async_callback(_cancel_task, presign_task)
+            log.info("flow.presign.start", doc=lot_doc_id)
+
         # Doc-pool prewarm is ONLY needed when we will sign documents.
         # resume_app_id (fast-T0 phase-2) skips docs — prewarming here used to
         # burn ~6s on the critical path for nothing.
@@ -828,6 +902,7 @@ async def submit_bid(
         skip_docs = False
         app_lot_map: dict = {}
         fetched_price_page = None
+        price_watch: Optional[_PricePageWatch] = None
         if params.resume_app_id:
             app_id = str(params.resume_app_id)
             state.application_id = app_id
@@ -847,6 +922,9 @@ async def submit_bid(
                 log.info("flow.beneficiary.early_check_started")
 
             # === create / lots ===
+            # The portal answers the create POST without the draft's id; with
+            # hedged_reads the id is read while that POST is still running.
+            hedged = bool(params.hedged_reads) and isinstance(gz, GoszakupClient)
             app_id = await gz.create_application(
                 params.announce_id,
                 subject_address=company["subject_address"],
@@ -854,6 +932,7 @@ async def submit_bid(
                 contact_phone=company.get("contact_phone", ""),
                 tax_payer_type=company.get("tax_payer_type", "UL"),
                 consortium=company.get("consortium", 0),
+                **({"early_id": True} if hedged else {}),
             )
             if not app_id:
                 raise RuntimeError("create_application did not return application_id")
@@ -866,13 +945,33 @@ async def submit_bid(
             # === add_lots + lots_next FIRST (server requires them before doc generation) ===
             add_lots_reply = await gz.add_lots(params.announce_id, app_id, params.tender_lot_ids)
             _mark(state, "lots_selected")
+            _remember_page("add_lots_reply", getattr(add_lots_reply, "text", "") or "")
             # The app_lot ids exist once add_lots answers. Read them while
             # lots_next is in flight; nothing is written before lots_next ends.
-            early_lots_task = None
+            # The portal serves these pages only once lots_next has committed,
+            # so the read is repeated on a cadence (hedged_reads): the first
+            # probe evaluated after the commit wins, up to a round-trip sooner
+            # than a read sent after lots_next's answer.
+            early_lots = early_docs = lots_page_read = None
             if params.early_app_lots:
-                early_lots_task = asyncio.create_task(_probe_app_lots(gz, params, app_id))
-                stack.push_async_callback(_cancel_task, early_lots_task)
+                early_lots = HedgedRead(
+                    lambda _n: _probe_app_lots(gz, params, app_id),
+                    interval_s=_STAGE_READ_INTERVAL_S, max_inflight=3,
+                    max_total=_STAGE_READ_MAX_TOTAL if hedged else 1, label="app_lots").start()
+                stack.push_async_callback(early_lots.aclose)
+            if hedged and params.early_app_lots:
+                early_docs = HedgedRead(
+                    lambda _n: _probe_docs_page(gz, params, app_id),
+                    first_delay_s=_DOCS_LIST_FIRST_DELAY_S, interval_s=_DOCS_LIST_INTERVAL_S,
+                    max_inflight=2, max_total=_DOCS_LIST_MAX_TOTAL, label="docs_page").start()
+                stack.push_async_callback(early_docs.aclose)
+                # Diagnostics: the lots page as it stands right after add_lots.
+                lots_page_read = asyncio.create_task(_read_lots_page(gz, params, app_id))
+                stack.push_async_callback(_cancel_task, lots_page_read)
             await gz.lots_next(params.announce_id, app_id)
+            for early_read in (early_lots, early_docs):
+                if early_read is not None:
+                    early_read.stop()      # probes already out may still win
             state.step = "lots_added"
             _mark(state, "lots_done")
             state_store.save(state)
@@ -889,9 +988,11 @@ async def submit_bid(
             # ALONGSIDE them instead of as its own serial round-trip in front.
             async def _load_docs_page() -> Optional[str]:
                 try:
-                    docs_html = await gz._get_page(
-                        f"/ru/application/docs/{params.announce_id}/{app_id}"
-                    )
+                    docs_html, early_won = await first_of(
+                        _early_result(early_docs),
+                        lambda: gz._get_page(f"/ru/application/docs/{params.announce_id}/{app_id}"))
+                    if early_won:
+                        log.info("flow.docs_page.early_won")
                     params.doc_plan = _adapt_doc_plan(params.doc_plan, docs_html or "")
                     docs_titles.update(_doc_titles(docs_html or ""))
                     _note_early_lp_ids(docs_html or "", "docs_page")
@@ -903,7 +1004,7 @@ async def submit_bid(
             docs_page_task = asyncio.create_task(_load_docs_page())
             stack.push_async_callback(_cancel_task, docs_page_task)
             app_lots_task = asyncio.create_task(
-                _resolve_app_lots(gz, params, app_id, early=early_lots_task,
+                _resolve_app_lots(gz, params, app_id, early=_early_result(early_lots),
                                   docs_page_task=docs_page_task)
             )
             stack.push_async_callback(_cancel_task, app_lots_task)
@@ -941,6 +1042,7 @@ async def submit_bid(
                     beneficiary=beneficiary, base_url=base_url, spec=spec,
                     sig_cache=tz_sig_cache,
                     checked_beneficiary_file=checked_beneficiary_file,
+                    presign=tender_files,
                 )
 
             # Keep each document on the same sibling used in _save_parallel_sessions.
@@ -959,6 +1061,10 @@ async def submit_bid(
                          ok=bool(app_lot_map) and all(
                              str(al) in reply_text for al in app_lot_map.values()),
                          len=len(reply_text))
+                if lots_page_read is not None:
+                    # Off the critical path: reported whenever that read lands.
+                    stack.push_async_callback(_cancel_task, asyncio.ensure_future(
+                        _report_lots_page(lots_page_read, dict(app_lot_map))))
                 # the plan (agreement id) must be final before the doc phase reads it
                 await asyncio.shield(docs_page_task)
             except AlreadyAtPriceStage as exc:
@@ -980,7 +1086,7 @@ async def submit_bid(
             save_ops = await _process_documents(
                 gz, ns, params, app_id, app_lot_map, beneficiary, base_url,
                 doc_pool=doc_pool, early_futures=early_futures,
-                sig_cache=tz_sig_cache,
+                sig_cache=tz_sig_cache, presign=tender_files,
             )
             state.step = "docs_signed"
             _mark(state, "docs_signed")
@@ -991,8 +1097,14 @@ async def submit_bid(
                     gz, ns, params, app_id, app_lot_map, base_url,
                     save_ops, msg, level, docs_titles)
 
+            # The price page is the first thing needed after docs_next: read it
+            # while docs_next is in flight (never when the bid stops here).
+            if (params.hedged_reads and not params.stop_after_docs
+                    and isinstance(gz, GoszakupClient)):
+                price_watch = _PricePageWatch(gz, params.announce_id, app_id)
+                stack.push_async_callback(price_watch.aclose)
             body, accepted, message = await _docs_next_until_accepted(
-                gz, params.announce_id, app_id, on_reject=_resave_cb)
+                gz, params.announce_id, app_id, on_reject=_resave_cb, watch=price_watch)
             if not accepted:
                 state.step = "docs_rejected"
                 state.error = message or (body[:400] if body else "docs_next rejected")
@@ -1020,6 +1132,7 @@ async def submit_bid(
             warm_reconnect_task=warm_reconnect_task,
             cached_lp_id=cached_lp_id,
             fetched_price_page=fetched_price_page,
+            early_price_page=price_watch.early() if price_watch is not None else None,
         )
         _mark(state, "gamma_done")
         if lp_id_cache is not None and price_cache_key is not None:
@@ -1103,9 +1216,203 @@ def _note_early_lp_ids(html_text: str, source: str) -> None:
     """Diagnostics only: does a page read BEFORE the price stage already carry
     the lot-point ids (buy_lot_point_id)? If so, ajax_get_encr_info could start
     alongside the price page GET instead of after it."""
+    _remember_page(source, html_text)
     if html_text and "buy_lot_point_id" in html_text:
         n = len(set(re.findall(r'buy_lot_point_id\D{0,4}(\d+)', html_text)))
         log.info("flow.lp_id.early_seen", source=source, n=n)
+
+
+def _id_context(text: str, number: int) -> str:
+    """Where on a page a number sits, as a short code that is safe to report:
+    ``attr.value``, ``attr.data-lot-id``, ``url.show_doc``, ``call.fn``, ``text``."""
+    found = re.search(rf"(?<!\d){number}(?!\d)", text or "")
+    if not found:
+        return "none"
+    before = text[max(0, found.start() - 80):found.start()]
+    attr = re.search(r"([A-Za-z_][A-Za-z0-9_-]{0,24})\s*=\s*[\"']?\s*$", before)
+    if attr:
+        return f"attr.{attr.group(1)}"[:40]
+    url = re.search(r"/([a-z_]{2,24})/(?:\d+/)*$", before)
+    if url:
+        return f"url.{url.group(1)}"[:40]
+    call = re.search(r"([A-Za-z_][A-Za-z0-9_]{0,24})\s*\(\s*(?:[^()]{0,40},\s*)?[\"']?$", before)
+    if call:
+        return f"call.{call.group(1)}"[:40]
+    return "text"
+
+
+def _report_early_lp_ids(lp_ids: Sequence[int]) -> None:
+    """Diagnostics: which page read BEFORE the price stage already names the lot
+    point ids the price page has just revealed? If one does, a first bid could
+    send ajax_get_encr_info together with the price page read (a repeat bid
+    already does) — one round-trip less on the critical path."""
+    pages = _seen_pages.get()
+    if not pages or not lp_ids:
+        return
+    try:
+        hits = 0
+        for source, text in pages.items():
+            found = [lp for lp in lp_ids if re.search(rf"(?<!\d){int(lp)}(?!\d)", text)]
+            if found:
+                hits += 1
+                log.info("flow.lp_id.seen_before", source=source, n=len(found),
+                         ctx=_id_context(text, int(found[0])))
+        log.info("flow.lp_id.early_pages", n=len(pages), hit=hits)
+    except (TypeError, ValueError):  # diagnostics must never cost a bid
+        pass
+    pages.clear()
+
+
+async def _peek(gz, path: str):
+    """A read that overlaps a write: sent so that it can neither rotate nor
+    replace the session (GoszakupClient.peek). Other clients (tests) get a
+    plain GET without redirects."""
+    peek = getattr(gz, "peek", None)
+    if peek is not None:
+        return await peek(path)
+    return await gz._http.get(path, follow_redirects=False)
+
+
+def _early_result(read: Optional[HedgedRead]) -> Optional[asyncio.Future]:
+    """A future for the first hit of ``read``. Already resolved when the hit is
+    in, so the caller can tell "the page is here" from "probes still out"
+    without yielding (and without starting a read it would only cancel)."""
+    if read is None:
+        return None
+    hit = read.hit
+    if hit is not None:
+        ready = asyncio.get_running_loop().create_future()
+        ready.set_result(hit)
+        return ready
+    return asyncio.ensure_future(read.first())
+
+
+def _is_full_docs_page(text: str, params, app_id) -> bool:
+    """Is this the application's COMPLETE document list?
+
+    The list decides which id Приложение 2 has on this tender (_adapt_doc_plan),
+    so a partial page must never stand in for it: every planned document has to
+    be linked, the agreement under one of its ids or as one more row.
+    """
+    listed = {int(doc) for doc in re.findall(
+        rf"/show_doc/{re.escape(str(params.announce_id))}/{re.escape(str(app_id))}/(\d+)", text)}
+    fixed = {spec.doc_id for spec in params.doc_plan if spec.doc_id not in _AGREEMENT_DOC_IDS}
+    has_agreement = any(spec.doc_id in _AGREEMENT_DOC_IDS for spec in params.doc_plan)
+    return bool(listed) and fixed <= listed and len(listed) >= len(fixed) + int(has_agreement)
+
+
+async def _probe_docs_page(gz, params, app_id) -> Optional[str]:
+    """One read of the application's document list, sent while lots_next is in
+    flight. A redirect (the stage has not changed yet) or anything short of
+    this application's complete list yields None — the usual read then decides.
+    Never raises (except on cancellation)."""
+    try:
+        r = await _peek(gz, f"/ru/application/docs/{params.announce_id}/{app_id}")
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — the usual read still runs
+        return None
+    if r.status_code != 200:
+        return None
+    text = r.text
+    return text if _is_full_docs_page(text, params, app_id) else None
+
+
+async def _read_lots_page(gz, params, app_id) -> str:
+    """Diagnostics only: the applicant's lots page as it stands right after
+    add_lots (read while lots_next runs; nothing waits for it)."""
+    try:
+        r = await _peek(gz, f"/ru/application/lots/{params.announce_id}/{app_id}")
+        text = r.text if r.status_code == 200 else ""
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        return ""
+    _remember_page("lots_page", text)
+    return text
+
+
+async def _report_lots_page(read, app_lot_map: dict) -> None:
+    """Diagnostics: are the app_lot ids already on the lots page — i.e. known a
+    whole lots_next before the document stage starts? If they are, the lot
+    documents could be prepared without the separate read of the тех.спец page."""
+    text = await read
+    try:
+        ids = [int(al) for al in app_lot_map.values()]
+        found = [al for al in ids if re.search(rf"(?<!\d){al}(?!\d)", text)]
+        log.info("flow.lots_page.app_lot_seen", ok=bool(ids) and len(found) == len(ids),
+                 len=len(text), ctx=_id_context(text, found[0]) if found else "none")
+    except (TypeError, ValueError):  # diagnostics must never cost a bid
+        pass
+
+
+async def _presign_tech_spec(gz, ns, params, doc_id, sig_cache, files) -> None:
+    """Background: sign the tender's own lot documents from the announcement's
+    file list (presign.py). Runs on a client that carries NO cabinet session —
+    the list and the files are public — so nothing it does can rotate or lock
+    the session the bid is about to use.
+    Never raises (except on cancellation) — it is purely an optimisation."""
+    try:
+        async with gz.clone_unauthenticated() as anonymous:
+            signer = LocalSigner(kalkan_signer=ns.kalkan, http_client=anonymous._http)
+            await presign_files.run(
+                anonymous, signer, announce_id=params.announce_id,
+                lot_ids=params.tender_lot_ids, doc_id=doc_id, sig_cache=sig_cache,
+                files=files, main_http=gz._http)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.info("flow.presign.failed", error_type=type(exc).__name__)
+    finally:
+        files.finished = True
+
+
+class _PricePageWatch:
+    """Reads of the price page that overlap ajax_docs_next.
+
+    The page is served only once docs_next has moved the draft to the price
+    stage; until then the portal redirects and the probe is ignored. A hit is
+    a complete, verified page of THIS application (see _verified_price_page).
+    """
+
+    def __init__(self, gz, announce_id: str, app_id: str):
+        self._gz = gz
+        self._announce_id = announce_id
+        self._app_id = app_id
+        self._read: Optional[HedgedRead] = None
+        self._polls = 0
+
+    async def _probe(self, attempt: int) -> Optional[FetchedPricePage]:
+        r = await _peek(
+            self._gz, f"/ru/application/priceoffers/{self._announce_id}/{self._app_id}")
+        return _verified_price_page(self._gz, r, self._announce_id, self._app_id)
+
+    def poll_started(self) -> None:
+        self._polls += 1
+        if self._polls > _PRICE_READ_ATTEMPTS or self._read is not None:
+            return
+        self._read = HedgedRead(
+            self._probe, first_delay_s=_PRICE_READ_FIRST_DELAY_S,
+            interval_s=_PRICE_READ_INTERVAL_S, max_inflight=2,
+            max_total=_PRICE_READ_MAX_TOTAL, label="price_page").start()
+
+    async def poll_rejected(self) -> None:
+        # A rejected poll changed nothing, so every probe still out is a miss.
+        read, self._read = self._read, None
+        if read is not None:
+            await read.aclose()
+
+    def poll_accepted(self) -> None:
+        if self._read is not None:
+            self._read.stop()
+
+    def early(self) -> Optional[asyncio.Future]:
+        return _early_result(self._read)
+
+    async def aclose(self) -> None:
+        read, self._read = self._read, None
+        if read is not None:
+            await read.aclose()
 
 
 async def _probe_app_lots(gz, params, app_id) -> Optional[dict[int, int]]:
@@ -1118,8 +1425,7 @@ async def _probe_app_lots(gz, params, app_id) -> Optional[dict[int, int]]:
     ann = params.announce_id
     lot_doc = next((s.doc_id for s in params.doc_plan if s.kind == "lot_sign"), 3334)
     try:
-        r = await gz._http.get(f"/ru/application/show_doc/{ann}/{app_id}/{lot_doc}",
-                               follow_redirects=False)
+        r = await _peek(gz, f"/ru/application/show_doc/{ann}/{app_id}/{lot_doc}")
         html_text = r.text if r.status_code == 200 else ""
         _note_early_lp_ids(html_text, "lot_parent")
         got = _extract_app_lot_mapping(html_text, params.tender_lot_ids) if html_text else {}
@@ -1191,6 +1497,8 @@ async def _discover_app_lots(gz, params, app_id, *, docs_page_task=None) -> dict
                 html_text = response.text
             else:
                 html_text = await gz._get_page(cand)
+        if cand == candidates[0]:
+            _remember_page("lot_parent", html_text)
         # A redirect to an already-advanced draft skips discovery. Stage markers
         # are explicit, unlike links to preview/priceoffers on other pages.
         if 'current_method = "preview"' in html_text:
@@ -1347,6 +1655,7 @@ async def _select_deposit_type(gz, ann, app_id, doc_id, app_lot, type_doc) -> No
         return
     if response.is_error:
         response.raise_for_status()
+    _remember_page("deposit", getattr(response, "text", "") or "")
 
 
 @dataclass
@@ -1358,11 +1667,86 @@ class _SaveOp:
     label: str
     doc_id: int
     run: Callable[["GoszakupClient"], Awaitable]
+    page: Optional[tuple[int, int]] = None      # (app_lot, num) of a тех.спец page
+
+
+class _PresignLedger:
+    """тех.спец signatures committed from the pre-signed tender file, each still
+    awaiting the byte-for-byte check of the application's own copy.
+
+    The commit goes out at once; the copy is downloaded alongside it and its
+    sha256 compared (_verify_presigned). ``settle`` is awaited before the
+    document counts as done — so before docs_next — and returns the pages whose
+    signatures had to be replaced and must be saved again.
+    """
+
+    def __init__(self) -> None:
+        self._checks: list[asyncio.Future] = []
+        self._pages: list[tuple[tuple[int, int], dict, dict[int, asyncio.Future]]] = []
+
+    def check(self, coro) -> asyncio.Future:
+        task = asyncio.ensure_future(coro)
+        self._checks.append(task)
+        return task
+
+    def attach(self, page: tuple[int, int], sigs: dict, checks: dict) -> None:
+        self._pages.append((page, sigs, checks))
+
+    async def settle(self) -> set[tuple[int, int]]:
+        dirty: set[tuple[int, int]] = set()
+        pages, self._pages = self._pages, []
+        for page, sigs, checks in pages:
+            for fid, check in checks.items():
+                corrected = await check
+                if corrected is not None:
+                    sigs[fid] = corrected      # the dict the page's _SaveOp posts
+                    dirty.add(page)
+        return dirty
+
+    async def aclose(self) -> None:
+        pending = [check for check in self._checks if not check.done()]
+        for check in pending:
+            check.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for check in self._checks:
+            if not check.cancelled():
+                check.exception()
+        self._checks.clear()
+        self._pages.clear()
+
+
+async def _verify_presigned(ns, url: str, referer: str, fid: int, expected, sig_cache) -> Optional[str]:
+    """Download the application's own copy of a тех.спец file and compare it
+    with the tender file its signature was made from.
+
+    None = identical, the committed signature stands (and is remembered under
+    this file id). Otherwise the signature of the bytes actually attached to
+    the application — the caller re-saves the page with it.
+    """
+    for attempt in (1, 2):
+        try:
+            data = await ns.fetch_bytes(url, referer=referer)
+            break
+        except httpx.TransportError as exc:
+            if attempt == 2:
+                raise
+            log.warning("flow.lot_doc.presign_check_retry", fid=fid, error_type=type(exc).__name__)
+            await asyncio.sleep(0.2)
+    if hashlib.sha256(data).hexdigest() == expected.sha256:
+        ns.remember_signature(sig_cache, f"fid:{fid}", expected.signature)
+        log.info("flow.lot_doc.presign_verified", fid=fid, bytes=len(data))
+        return None
+    log.error("flow.lot_doc.presign_mismatch", fid=fid, bytes=len(data))
+    _digest, signature = await ns.sign_content(data, sig_cache)
+    ns.remember_signature(sig_cache, f"fid:{fid}", signature)
+    return signature
 
 
 async def _prepare_doc(gz, ns, params, app_id, app_lot_map, beneficiary, base_url, spec,
                        sig_cache: dict | None = None, on_ready=None,
-                       checked_beneficiary_file: bool = False):
+                       checked_beneficiary_file: bool = False,
+                       presign=None, ledger: Optional[_PresignLedger] = None):
     """Do everything for one doc EXCEPT the final signature-commit save: generate /
     upload / describe / download / GOST-sign. Returns the deferred _SaveOp(s).
 
@@ -1442,10 +1826,12 @@ async def _prepare_doc(gz, ns, params, app_id, app_lot_map, beneficiary, base_ur
         # (read-only, parallel inside), defer each page's save POST.
         ops = []
         lots = list(app_lot_map.values())
+        tender_lot_of = {app_lot: tender_lot for tender_lot, app_lot in app_lot_map.items()}
 
         def pages_for(app_lot):
             return aclosing(_lot_sign_pages(
-                gz, ns, ann, app_id, spec.doc_id, app_lot, base_url, sig_cache=sig_cache))
+                gz, ns, ann, app_id, spec.doc_id, app_lot, base_url, sig_cache=sig_cache,
+                presign=presign, presign_lot=tender_lot_of.get(app_lot), ledger=ledger))
 
         pending = None
         async with AsyncExitStack() as lookahead:
@@ -1471,7 +1857,8 @@ async def _prepare_doc(gz, ns, params, app_id, app_lot_map, beneficiary, base_ur
                     op = _SaveOp(
                         f"lot_{spec.doc_id}_{app_lot}_{num}", spec.doc_id,
                         lambda c, d=spec.doc_id, lot=app_lot, n=num, s=sigs:
-                            c.sign_lot_doc(ann, app_id, d, lot, n, signatures=s))
+                            c.sign_lot_doc(ann, app_id, d, lot, n, signatures=s),
+                        page=(app_lot, num))
                     ops.append(op)
                     if on_ready is not None:
                         await on_ready(op)
@@ -1482,7 +1869,7 @@ async def _prepare_doc(gz, ns, params, app_id, app_lot_map, beneficiary, base_ur
 
 
 async def _process_documents(gz, ns, params, app_id, app_lot_map, beneficiary, base_url,
-                             doc_pool=None, early_futures=None, sig_cache=None):
+                             doc_pool=None, early_futures=None, sig_cache=None, presign=None):
     """Sign + commit every document; return the prepared _SaveOp list (so the
     docs_next self-heal can re-commit serially on the main session).
 
@@ -1503,7 +1890,7 @@ async def _process_documents(gz, ns, params, app_id, app_lot_map, beneficiary, b
         if params.signer is not None:
             return await _save_parallel_sessions(
                 gz, params, app_id, app_lot_map, beneficiary, base_url, doc_pool or [],
-                early_futures=early_futures or {}, sig_cache=sig_cache)
+                early_futures=early_futures or {}, sig_cache=sig_cache, presign=presign)
         log.warning("flow.doc_save_mode.parallel_unavailable",
                     reason="needs signer; using serial")
 
@@ -1577,6 +1964,7 @@ def _lot_barrier_mode(params) -> str:
 async def _run_doc_in_session(
     gz, sib, sib_ns, params, app_id, app_lot_map, beneficiary, base_url, spec: DocSpec,
     sig_cache: dict | None = None, checked_beneficiary_file: bool = False,
+    presign=None,
 ) -> list[_SaveOp]:
     """Prepare + save one document in an isolated session.
 
@@ -1586,6 +1974,12 @@ async def _run_doc_in_session(
     The тех.спец pages are committed as each one becomes ready (page 1 is saved
     while page 2 is still downloading) — same save order and the same barrier
     between saves, just without idling until the slowest page has been fetched.
+
+    ``presign`` (presign.TenderFiles): a page whose files were signed from the
+    tender's public copies before the opening is committed without waiting for
+    its download. The application's copies are still downloaded and compared;
+    this function does not return before every such check has passed, or the
+    page has been saved again with the signature of the real bytes.
     """
     ann = params.announce_id
     needs_barrier = spec.kind == "lot_sign"
@@ -1625,27 +2019,41 @@ async def _run_doc_in_session(
             if isinstance(res, BaseException):
                 raise res
 
+    ledger = _PresignLedger() if (needs_barrier and presign is not None) else None
     try:
-        ops = await _prepare_doc(
-            sib, sib_ns, params, app_id, app_lot_map, beneficiary, base_url, spec,
-            sig_cache=sig_cache, on_ready=_on_ready if needs_barrier else None,
-            checked_beneficiary_file=checked_beneficiary_file)
-    except BaseException:
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        raise
-    await _settle()
-    for op in ops:
-        if id(op) not in committed:
-            await _commit(op)
-    if ops and (barrier_mode == "last" or (parallel and barrier_mode == "each")):
-        await _barrier()
-    return ops
+        try:
+            ops = await _prepare_doc(
+                sib, sib_ns, params, app_id, app_lot_map, beneficiary, base_url, spec,
+                sig_cache=sig_cache, on_ready=_on_ready if needs_barrier else None,
+                checked_beneficiary_file=checked_beneficiary_file,
+                presign=presign, ledger=ledger)
+        except BaseException:
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            raise
+        await _settle()
+        for op in ops:
+            if id(op) not in committed:
+                await _commit(op)
+        if ledger is not None:
+            # Every pre-signed page is checked against the application's own
+            # file before this document counts as done (hence before docs_next).
+            dirty = await ledger.settle()
+            for op in ops:
+                if op.page in dirty:
+                    log.error("flow.lot_doc.presign_resaved", doc=op.doc_id, num=op.page[1])
+                    await _commit(op)
+        if ops and (barrier_mode == "last" or (parallel and barrier_mode == "each")):
+            await _barrier()
+        return ops
+    finally:
+        if ledger is not None:
+            await ledger.aclose()
 
 
 async def _save_parallel_sessions(gz, params, app_id, app_lot_map, beneficiary, base_url, pool,
                                   early_futures: dict | None = None,
-                                  sig_cache: dict | None = None):
+                                  sig_cache: dict | None = None, presign=None):
     """B (experimental): one logged-in session per document, run fully in parallel.
 
     Each session runs its doc's WHOLE flow (generate→sign→save), not just the save:
@@ -1710,7 +2118,7 @@ async def _save_parallel_sessions(gz, params, app_id, app_lot_map, beneficiary, 
             else:
                 ops = await _run_doc_in_session(
                     gz, sib, sib_ns, params, app_id, app_lot_map, beneficiary, base_url, spec,
-                    sig_cache=sig_cache)
+                    sig_cache=sig_cache, presign=presign)
         except SessionExpired:
             if not acc_pw:
                 raise
@@ -1718,7 +2126,7 @@ async def _save_parallel_sessions(gz, params, app_id, app_lot_map, beneficiary, 
             await _relogin_once(sib, sib_ns, seen_gen)
             ops = await _run_doc_in_session(
                 gz, sib, sib_ns, params, app_id, app_lot_map, beneficiary, base_url, spec,
-                sig_cache=sig_cache)
+                sig_cache=sig_cache, presign=presign)
         async with lock:
             all_ops.extend(ops)
 
@@ -1837,7 +2245,9 @@ def _lot_subdoc_actionable(sig: dict) -> bool:
 
 async def _probe_lot_page(gz, ns, ann, app_id, doc_id, app_lot, num, base_url, *,
                           with_retry: bool, sig_cache: dict | None = None,
-                          pages_with_files: set[int] | None = None):
+                          pages_with_files: set[int] | None = None,
+                          presign=None, presign_lot: Optional[int] = None,
+                          ledger: Optional[_PresignLedger] = None):
     """GET one тех.спец sub-doc page; if it carries auto-attached files, download +
     sign them. Returns (kind, payload):
         ("file", {fid: sig})      signable page (signatures computed, NOT saved)
@@ -1846,7 +2256,12 @@ async def _probe_lot_page(gz, ns, ann, app_id, doc_id, app_lot, num, base_url, *
         ("unreachable", None)     the GET failed
     `with_retry` re-fetches an actionable-but-fileless page a few times (a freshly
     generated file can lag); the concurrent first pass uses with_retry=False so a
-    lagging page doesn't hold the whole batch."""
+    lagging page doesn't hold the whole batch.
+
+    ``presign`` + ``ledger``: a file whose link text names exactly one tender
+    file signed before the opening gets that signature at once; its download
+    and sha256 comparison are handed to the ledger instead of being awaited
+    here (see _PresignLedger)."""
     attempts = 4 if with_retry else 1
     last: tuple[str, dict] = ("end", {})
     for attempt in range(1, attempts + 1):
@@ -1884,6 +2299,7 @@ async def _probe_lot_page(gz, ns, ann, app_id, doc_id, app_lot, num, base_url, *
             return "end", sig
         if pages_with_files is not None:
             pages_with_files.add(num)
+        _remember_page(f"lot_page_{num}", html)
         # Download + sign this page's files CONCURRENTLY — a multi-file page (the
         # тех.спец num=2 carries the 1.7MB + 2.2MB files) otherwise fetches them
         # one after another. The Kalkan signer serializes the actual GOST op
@@ -1892,22 +2308,41 @@ async def _probe_lot_page(gz, ns, ann, app_id, doc_id, app_lot, num, base_url, *
         # cache_key: the customer's тех.спец file is immutable per file_id, so a
         # signature made for it before (an earlier attempt / dry-run on this
         # tender) is reused WITHOUT downloading the file again.
-        sig_list = await asyncio.gather(*[
-            ns.sign_file(f"{base_url}{dl}", sig_cache=sig_cache, referer=referer,
-                         cache_key=f"fid:{_fid}")
-            for _fid, dl in targets
-        ])
+        # What the page calls each file (also reported, so a report shows
+        # whether pages of this portal name their files at all).
+        names = presign_files.link_names(html) if presign is not None else {}
+        early = bool(names) and ledger is not None and len(presign) > 0
+        checks: dict[int, asyncio.Future] = {}
+
+        async def _signature(fid: int, dl: str) -> str:
+            url = f"{base_url}{dl}"
+            if early and ns.cached_signature(sig_cache, f"fid:{fid}") is None:
+                ready = presign.match(presign_lot, names.get(fid, ()))
+                if ready is not None:
+                    checks[fid] = ledger.check(
+                        _verify_presigned(ns, url, referer, fid, ready, sig_cache))
+                    return ready.signature
+            return await ns.sign_file(url, sig_cache=sig_cache, referer=referer,
+                                      cache_key=f"fid:{fid}")
+
+        sig_list = await asyncio.gather(*[_signature(_fid, dl) for _fid, dl in targets])
         sigs = {fid: s for (fid, _dl), s in zip(targets, sig_list)}
+        if checks:
+            ledger.attach((app_lot, num), sigs, checks)
 
         log.info("flow.lot_doc.prepared", doc=doc_id, app_lot=app_lot, num=num,
-                 files=[fid for fid, _dl in targets])
+                 files=[fid for fid, _dl in targets], n=len(targets),
+                 named=sum(1 for fid, _dl in targets if names.get(fid)),
+                 presigned=len(checks))
         return "file", sigs
     return last
 
 
 async def _lot_sign_pages(gz, ns, ann, app_id, doc_id, app_lot, base_url,
                           max_nums: int = 10, probe_width: int = 3,
-                          sig_cache: dict | None = None):
+                          sig_cache: dict | None = None, presign=None,
+                          presign_lot: Optional[int] = None,
+                          ledger: Optional[_PresignLedger] = None):
     """тех.спец (doc 3334): yield ``(num, {fid: sig})`` for every signable sub-doc
     page, in page order, AS SOON AS each one is downloaded + signed.
 
@@ -1926,7 +2361,9 @@ async def _lot_sign_pages(gz, ns, ann, app_id, doc_id, app_lot, base_url,
         return _probe_lot_page(gz, ns, ann, app_id, doc_id, app_lot, n, base_url,
                                with_retry=with_retry,
                                sig_cache=sig_cache if use_cache else None,
-                               pages_with_files=pages_with_files)
+                               pages_with_files=pages_with_files,
+                               presign=presign if use_cache else None,
+                               presign_lot=presign_lot, ledger=ledger)
 
     ahead = {n: asyncio.ensure_future(_probe(n, with_retry=False))
              for n in range(1, width + 1)}
@@ -2115,8 +2552,12 @@ async def _prefetch_encr_info(gz, ann, app_id, lp_id, version, cookies) -> dict 
 
 async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None,
                        warm_reconnect_task=None, cached_lp_id: int | None = None,
-                       fetched_price_page: FetchedPricePage | None = None):
-    """Encrypt and sign each price for the current application."""
+                       fetched_price_page: FetchedPricePage | None = None,
+                       early_price_page=None):
+    """Encrypt and sign each price for the current application.
+
+    ``early_price_page``: a future for a price page read while docs_next was in
+    flight (_PricePageWatch). It is raced against the usual read."""
     ann = params.announce_id
     tumar = params.tumar
     reconnect_task = warm_reconnect_task
@@ -2145,17 +2586,29 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None,
             log.info("flow.gamma.encr_info_prefetch", lp_id=cached_lp_id)
 
     price_path = f"/ru/application/priceoffers/{ann}/{app_id}"
-    if fetched_price_page is not None and _price_session_cookies(gz) == fetched_price_page.cookies:
-        po_html = fetched_price_page.html
-        log.info("flow.priceoffers.reused_on_resume", app_id=app_id)
-    else:
+
+    async def _read_price_page() -> str:
         try:
-            po_html = await gz._get_page(price_path)
+            return await gz._get_page(price_path)
         except (httpx.TransportError, httpx.HTTPStatusError) as exc:
             if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500:
                 raise
             log.warning("flow.priceoffers.fetch_retry", detail=type(exc).__name__)
-            po_html = await gz._get_page(price_path)
+            return await gz._get_page(price_path)
+
+    if fetched_price_page is not None and _price_session_cookies(gz) == fetched_price_page.cookies:
+        po_html = fetched_price_page.html
+        log.info("flow.priceoffers.reused_on_resume", app_id=app_id)
+    else:
+        page, early_won = await first_of(early_price_page, _read_price_page)
+        if not early_won:
+            po_html = page
+        elif _price_session_cookies(gz) == page.cookies:
+            po_html = page.html
+            log.info("flow.priceoffers.early_won")
+        else:
+            # The session changed after that read; take the page again.
+            po_html = await _read_price_page()
     # Bring-up only: the inline <script> shows how get_encr_info maps to the
     # TumarCSP Param. Off the hot path now (set ATAGOS_DEBUG_DUMPS=1 to re-enable).
     if os.environ.get("ATAGOS_DEBUG_DUMPS"):
@@ -2184,6 +2637,7 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None,
         )
     log.info("flow.gamma.pairs", pairs=pairs)
     discovered_lp_ids = [lp_id for (_, lp_id) in pairs]
+    _report_early_lp_ids(discovered_lp_ids)
     if prefetched is not None and cached_lp_id not in discovered_lp_ids:
         await _cancel_task(prefetched)
         prefetched = None
@@ -2308,7 +2762,9 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None,
                 last_add = asyncio.ensure_future(add_call)
                 stack.push_async_callback(_cancel_task, last_add)
             else:
-                log.info("flow.gamma.add_encrypt", verdict=_reply_verdict(await add_call))
+                add_reply = await add_call
+                log.info("flow.gamma.add_encrypt", verdict=_reply_verdict(add_reply),
+                         reply=reply_shape(add_reply))
             if signing.done():
                 signing.result()
 
@@ -2324,17 +2780,21 @@ async def _gamma_price(gz, ns, params, app_id, stack, *, tumar_task=None,
         stack.push_async_callback(_cancel_task, signs_reply)
         add_reply, signs_reply = await asyncio.gather(last_add, signs_reply)
         add_verdict, signs_verdict = _reply_verdict(add_reply), _reply_verdict(signs_reply)
-        log.info("flow.gamma.parallel_signs", verdict=signs_verdict, source=add_verdict)
+        log.info("flow.gamma.parallel_signs", verdict=signs_verdict, source=add_verdict,
+                 reply=reply_shape(signs_reply))
         if signs_verdict != "ok":
             # Not a recognisable success: repeat it now that add_encrypt is in —
             # exactly the old order, one POST later.
             signs_reply = await gz.save_gamma_signs(ann, app_id, signs_by_lp=signs_by_lp)
-            log.info("flow.gamma.signs_resent", verdict=_reply_verdict(signs_reply))
+            log.info("flow.gamma.signs_resent", verdict=_reply_verdict(signs_reply),
+                     reply=reply_shape(signs_reply))
     else:
         signs_reply = await gz.save_gamma_signs(ann, app_id, signs_by_lp=signs_by_lp)
-        log.info("flow.gamma.save_signs", verdict=_reply_verdict(signs_reply))
+        log.info("flow.gamma.save_signs", verdict=_reply_verdict(signs_reply),
+                 reply=reply_shape(signs_reply))
     next_reply = await gz.priceoffers_next_gamma(ann, app_id, prices=encrypted_by_pair)
-    log.info("flow.gamma.priceoffers_next", verdict=_reply_verdict(next_reply))
+    log.info("flow.gamma.priceoffers_next", verdict=_reply_verdict(next_reply),
+             reply=reply_shape(next_reply))
     log.info("flow.gamma.done", dt_s=round(time.time() - t_gamma0, 3),
              n_lots=len(pairs))
     return discovered_lp_ids, prices_by_lp

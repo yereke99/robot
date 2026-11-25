@@ -98,6 +98,38 @@ class Portal:
         self.ts_overlap = cfg.get("ts_overlap", "violation")
         self.signs_before_encrypt = cfg.get("signs_before_encrypt", "violation")
         self.signs_posts = 0
+        # WHEN a request looks at the draft and when its own change lands, as
+        # fractions of its latency. The defaults (0 / 1) are the strictest
+        # portal: state is read on arrival and written with the answer, so a
+        # read sent while a POST is in flight can never see that POST's result.
+        # A PHP request that spends most of its time on bootstrap and session
+        # work is closer to e.g. 0.6 / 0.9 — that is what the reads which
+        # overlap a stage POST (goszakup/hedge.py) are betting on.
+        self.read_at = float(cfg.get("read_at", 0.0))
+        self.commit_at = float(cfg.get("commit_at", 1.0))
+        # The announcement's file list (presign.py):
+        #   listing     where it is served: "both" (default) | "public" |
+        #               "session" (the public host is down) | "none"
+        #   ts_names    the application's тех.спец pages link files by NAME
+        #   ts_copy_differs   page nums whose copy is NOT the tender's file
+        #   verify_signatures docs_next rejects a page saved with a signature
+        #               that does not belong to its file (False: it goes unnoticed)
+        #   stale_app   a draft id the applicant's lots page shows BEFORE create
+        self.listing = cfg.get("listing", "both")
+        self.ts_names = cfg.get("ts_names", True)
+        self.ts_copy_differs = set(cfg.get("ts_copy_differs", []))
+        self.verify_signatures = cfg.get("verify_signatures", True)
+        self.stale_app = cfg.get("stale_app")
+        self.ts_invalid: set[tuple[int, int]] = set()
+        self.docs_next_posts = 0
+        self.t_create_done = None
+        self.t_public_done = None
+        # Per-route latencies, to replay a live trace: {"lots_next": 1.67, ...}.
+        # Keys: add_lots lots_next lot_parent doc_get gen_<doc> save_<doc>
+        # deposit_add deposit_save ben_save check_status ts_page_<num>
+        # ts_save_<num> docs_next price_page encr_info add_encrypt save_signs
+        # price_next lots_page listing. Anything absent keeps G / P.
+        self.route_latency = dict(cfg.get("lat", {}))
 
         self.lot_ids = [41000001 + i for i in range(self.lots)]
         self.app_lots = {lid: 85000001 + i for i, lid in enumerate(self.lot_ids)}
@@ -116,7 +148,7 @@ class Portal:
         self.deposit_added: set[int] = set()
         self.deposit_saved: set[int] = set()
         self.ts_saved: dict[tuple[int, int], float] = {}   # (app_lot, num) -> commit time
-        self.ts_inflight = 0
+        self.ts_active: list[dict] = []                    # тех.спец saves in flight
         self.parent_get_since_last_ts_save = True
         self.last_ts_save_at = None
         self.salts: dict[int, str] = {}
@@ -131,6 +163,9 @@ class Portal:
     # ------------------------------------------------------------------ helpers
     def now(self) -> float:
         return self.loop.time()
+
+    def lat(self, name: str, default: float) -> float:
+        return float(self.route_latency.get(name, default))
 
     def bad(self, msg: str) -> None:
         self.violations.append(f"t={self.now():.2f} {msg}")
@@ -147,6 +182,39 @@ class Portal:
             self.sizes[f] = s
         return fids
 
+    # The customer's files: one set per tender lot, public before the opening.
+    # The application gets COPIES (ts_fids) — new ids, the same bytes.
+    def tender_fids(self, lot_id: int, num: int) -> list[int]:
+        app_lot = self.app_lots[lot_id]
+        fids = [f - 100000000 for f in self.ts_fids(app_lot, num)]
+        for public, copy in zip(fids, self.ts_fids(app_lot, num)):
+            self.sizes[public] = self.sizes[copy]
+        return fids
+
+    def ts_name(self, lot_id: int, num: int, k: int) -> str:
+        return f"techspec_{lot_id}.pdf" if num == 1 else f"LS{num}-{k}_{lot_id}_RU.xlsx"
+
+    def content(self, fid: int) -> bytes:
+        for lot_id, app_lot in self.app_lots.items():
+            for num in range(1, self.n_ts_pages + 1):
+                copies, originals = self.ts_fids(app_lot, num), self.tender_fids(lot_id, num)
+                for k, (copy, original) in enumerate(zip(copies, originals), start=1):
+                    if fid == copy and num in self.ts_copy_differs:
+                        return f"changed-{copy}".encode()
+                    if fid in (copy, original):
+                        return f"tf-{lot_id % 1000}-{num}-{k}".encode()
+        return f"file-{fid}".encode()
+
+    def listing_page(self) -> str:
+        def table(nums):
+            rows = "".join(
+                f'<tr><td> {lot_id}-ОК1 </td><td><a href="{BASE}/files/download_file/{fid}/{fid + 5}/">'
+                f"{self.ts_name(lot_id, num, k)}</a></td><td>Автор</td></tr>"
+                for lot_id in self.lot_ids for num in nums
+                for k, fid in enumerate(self.tender_fids(lot_id, num), start=1))
+            return f'<table class="table"><tr><th>Номер лота</th><th>Документ</th></tr>{rows}</table>'
+        return table([1]) + "<h4>Дополнительные файл</h4>" + table(range(2, self.n_ts_pages + 1))
+
     async def serve(self, request, latency, check_and_build, *, disconnect=False):
         """Session lock (optional) -> evaluate at arrival -> latency -> commit."""
         t0 = self.now()
@@ -155,11 +223,17 @@ class Portal:
         self.log.append(entry)
 
         async def run():
+            before = latency * self.read_at
+            if before > 0:
+                await asyncio.sleep(before)
             commit = check_and_build()            # returns (response, commit_fn|None)
             resp, commit_fn = commit if isinstance(commit, tuple) else (commit, None)
-            await asyncio.sleep(latency)
+            await asyncio.sleep(latency * (self.commit_at - self.read_at))
             if commit_fn:
                 commit_fn()
+            after = latency * (1.0 - self.commit_at)
+            if after > 0:
+                await asyncio.sleep(after)
             return resp
 
         if self.lock:
@@ -215,8 +289,11 @@ class Portal:
 
     def ts_page(self, app_lot: int, num: int) -> str:
         if num <= self.n_ts_pages:
+            lot_id = next(lid for lid, al in self.app_lots.items() if al == app_lot)
             links = "".join(
-                f'<a href="/files/download_file/{f}/">файл</a>' for f in self.ts_fids(app_lot, num))
+                f'<a href="/files/download_file/{f}/">'
+                f'{self.ts_name(lot_id, num, k) if self.ts_names else "файл"}</a>'
+                for k, f in enumerate(self.ts_fids(app_lot, num), start=1))
             return "<h3>Техническая спецификация</h3>" + links + PAD
         if num == self.n_ts_pages + 1:
             return ('<h3>Техническая спецификация</h3><form id="form_uploading">'
@@ -245,7 +322,8 @@ class Portal:
             return "Подпишите прикрепленный документ в категории Приложение 5"
         for al in self.app_lots.values():
             for num in range(1, self.n_ts_pages + 1):
-                if (al, num) not in self.ts_saved:
+                unsigned = (al, num) not in self.ts_saved
+                if unsigned or (self.verify_signatures and (al, num) in self.ts_invalid):
                     return ("Подпишите прикрепленный документ в категории Приложение 15 "
                             f"(Техническая спецификация) у лота № {lotname}")
         if self.last_ts_save_at is not None and self.now() < self.last_ts_save_at + self.lag:
@@ -301,28 +379,54 @@ class Portal:
                     body["application_id"] = APP
                 headers = {"Set-Cookie": "ci_session=after-create; Path=/"} if self.rotate_session_on_create else {}
                 return httpx.Response(200, json=body, headers=headers), commit
-            return await self.serve(request, self.create_post, build)
+            response = await self.serve(request, self.create_post, build)
+            self.t_create_done = self.now()
+            return response
 
         @r.get(url__regex=rf".*/ru/application/lots/{ANN}$")
         async def discover_application(request):
             def build():
+                # A read: harmless at any time. Before the draft exists the
+                # portal sends the applicant back to the create form — or shows
+                # an OLDER draft of this tender, if there is one (stale_app).
                 if not self.app_created:
-                    self.bad("application ID discovery before create committed")
-                    return httpx.Response(404, html="draft not found")
+                    if self.stale_app:
+                        page = f'<a href="/ru/application/lots/{ANN}/{self.stale_app}">Лоты заявки</a>' + PAD
+                        return httpx.Response(200, html=page)
+                    return httpx.Response(302, headers={"location": f"/ru/application/create/{ANN}"})
                 page = f'<a href="/ru/application/lots/{ANN}/{APP}">Лоты заявки</a>' + PAD
                 return httpx.Response(200, html=page)
             return await self.serve(request, self.lots_discovery_get, build)
 
+        @r.get(url__regex=rf".*/ru/announce/actionAjaxModalShowFiles/{ANN}/3334$")
+        async def tender_files(request):
+            public = "/__public__/" in request.url.path
+
+            if "ci_session" in request.headers.get("cookie", "") and public:
+                self.bad("the cabinet session was sent to the public file list")
+
+            served = self.listing == "both" or self.listing == ("public" if public else "session")
+            if public and not served:
+                raise httpx.ConnectError("the public portal is unreachable", request=request)
+
+            def build():
+                if not served:                 # the cabinet host without a usable session
+                    return httpx.Response(302, headers={"location": "/ru/user/login"})
+                return httpx.Response(200, html=self.listing_page())
+            return await self.serve(request, self.lat("listing", G), build)
+
         @r.post(url__regex=rf".*/ajax_add_lots/{ANN}/{APP}$")
         async def add_lots(request):
             def build():
+                if self.t_create_done is None:
+                    self.bad("add_lots before ajax_create_application answered")
                 if self.stage != "lots":
                     self.bad(f"add_lots at stage {self.stage}")
 
                 def commit():
                     self.lots_added = True
                 return httpx.Response(200, json={"status": "ok"}), commit
-            return await self.serve(request, P, build)
+            return await self.serve(request, self.lat("add_lots", P), build)
 
         @r.post(url__regex=rf".*/ajax_lots_next/{ANN}/{APP}$")
         async def lots_next(request):
@@ -333,7 +437,7 @@ class Portal:
                 def commit():
                     self.stage = "docs"
                 return httpx.Response(200, json={"status": "ok"}), commit
-            return await self.serve(request, P, build)
+            return await self.serve(request, self.lat("lots_next", P), build)
 
         @r.get(url__regex=rf".*/ru/application/docs/{ANN}/{APP}$")
         async def docs(request):
@@ -349,7 +453,8 @@ class Portal:
 
         @r.get(url__regex=rf".*/ru/application/lots/{ANN}/{APP}$")
         async def lots_page(request):
-            return await self.serve(request, G, lambda: httpx.Response(200, html="<html>lots</html>" + PAD))
+            return await self.serve(request, self.lat("lots_page", G),
+                                    lambda: httpx.Response(200, html="<html>lots</html>" + PAD))
 
         @r.get(url__regex=rf".*/ru/application/show_doc/{ANN}/{APP}/(\d+)$")
         async def show_doc(request):
@@ -371,7 +476,8 @@ class Portal:
                         and doc in self.generated):
                     return self.redirect_to_stage()
                 return httpx.Response(200, html=self.doc_page(doc))
-            return await self.serve(request, G, build)
+            return await self.serve(
+                request, self.lat("lot_parent" if doc == 3334 else "doc_get", G), build)
 
         @r.get(url__regex=rf".*/ru/application/show_doc/{ANN}/{APP}/3334/(\d+)/(\d+)$")
         async def ts_page(request):
@@ -384,15 +490,19 @@ class Portal:
                 if app_lot not in self.lp_ids:
                     self.bad(f"тех.спец page for unknown app_lot {app_lot}")
                 return httpx.Response(200, html=self.ts_page(app_lot, num))
-            return await self.serve(request, G, build)
+            return await self.serve(request, self.lat(f"ts_page_{num}", G), build)
 
         @r.get(url__regex=r".*/files/download_file/(\d+)/(?:(\d+)/)?$")
         async def download(request):
             fid = int(re.search(r"download_file/(\d+)", request.url.path).group(1))
+            if 600000000 <= fid < 700000000 and "ci_session" in request.headers.get("cookie", ""):
+                # the tender's public files are fetched while WAITING for the
+                # opening; a session-bearing side request then could rotate it
+                self.bad("the cabinet session was sent with a pre-opening file download")
             size = self.sizes.get(fid, 60_000)
             latency = self.dl_base + size / self.dl_rate
             return await self.serve(
-                request, latency, lambda: httpx.Response(200, content=f"file-{fid}".encode()))
+                request, latency, lambda: httpx.Response(200, content=self.content(fid)))
 
         @r.post(url__regex=rf".*/ru/application/show_doc/{ANN}/{APP}/(\d+)$")
         async def doc_post(request):
@@ -447,7 +557,9 @@ class Portal:
                     return response if disconnect == "before_commit" else (response, commit)
                 self.bad(f"unrecognised POST show_doc/{doc}: {sorted(form)}")
                 return httpx.Response(200, html="?")
-            return await self.serve(request, P, build, disconnect=disconnect is not None)
+            kind = "save" if sig_keys else "gen"
+            return await self.serve(request, self.lat(f"{kind}_{doc}", P), build,
+                                    disconnect=disconnect is not None)
 
         @r.post(url__regex=rf".*/ru/application/show_doc/{ANN}/{APP}/(\d+)/(\d+)/(\d+)/?(\?.*)?$")
         async def lot_post(request):
@@ -482,46 +594,64 @@ class Portal:
                 sigs = sorted(int(k[len("signature["):-1]) for k in form if k.startswith("signature["))
                 if sigs != sorted(self.ts_fids(app_lot, num)):
                     self.bad(f"тех.спец save {app_lot}/{num}: signatures for {sigs}")
-                overlapped = self.ts_inflight > 0
+                genuine = all(
+                    form.get(f"signature[{fid}]") == "SIG-" + self.content(fid).decode()[:20]
+                    for fid in self.ts_fids(app_lot, num))
+                # Overlap is mutual: of two saves in flight together, whichever
+                # commits LAST is the "last writer" (not whichever arrived last).
+                save = {"overlapped": bool(self.ts_active)}
+                for other in self.ts_active:
+                    other["overlapped"] = True
                 if self.ts_overlap == "violation":
-                    if overlapped:
+                    if save["overlapped"]:
                         self.bad("two тех.спец page saves OVERLAP")
                     if not self.parent_get_since_last_ts_save:
                         self.bad("тех.спец page saved without the GET barrier after the previous page")
-                self.ts_inflight += 1
+                self.ts_active.append(save)
 
                 n_try = self.ts_attempts.get((app_lot, num), 0) + 1
                 self.ts_attempts[(app_lot, num)] = n_try
 
                 def commit():
-                    self.ts_inflight -= 1
+                    self.ts_active.remove(save)
                     self.parent_get_since_last_ts_save = False
                     if num in self.drop_ts_first_save and n_try == 1:
                         return                                   # the lost save
-                    if overlapped and self.ts_overlap == "clobber":
+                    if save["overlapped"] and self.ts_overlap == "clobber":
                         # last-writer-wins: this page's commit wipes the others
                         for key in [k for k in self.ts_saved if k[0] == app_lot]:
                             del self.ts_saved[key]
                     self.ts_saved[(app_lot, num)] = self.now()
                     self.last_ts_save_at = self.now()
+                    if genuine:
+                        self.ts_invalid.discard((app_lot, num))
+                    else:
+                        self.ts_invalid.add((app_lot, num))
                 return httpx.Response(302, headers=loc), commit
-            return await self.serve(request, P * 1.3, build, disconnect=disconnect is not None)
+            if doc == 3328:
+                latency = self.lat("deposit_save" if deposit_save else "deposit_add", P * 1.3)
+            else:
+                latency = self.lat(f"ts_save_{num}", P * 1.3)
+            return await self.serve(request, latency, build, disconnect=disconnect is not None)
 
         @r.post(url__regex=r".*/files/check_status/$")
         async def check_status(request):
             if self.rotate_session_on_create and self.app_created:
                 if "ci_session=after-create" not in request.headers.get("cookie", ""):
                     self.bad("beneficiary file checked against the old session after create")
-            return await self.serve(request, P, lambda: httpx.Response(200, json={"status": 1}))
+            return await self.serve(request, self.lat("check_status", P),
+                                    lambda: httpx.Response(200, json={"status": 1}))
 
         @r.post(url__regex=r".*/ru/beneficiary/ajax_save_info$")
         async def ben_save(request):
             def build():
                 return httpx.Response(200, json={"status": 1}), (lambda: setattr(self, "beneficiary_saved", True))
-            return await self.serve(request, P, build)
+            return await self.serve(request, self.lat("ben_save", P), build)
 
         @r.post(url__regex=rf".*/ajax_docs_next/{ANN}/{APP}$")
         async def docs_next(request):
+            self.docs_next_posts += 1
+
             def build():
                 if self.stage != "docs":
                     self.bad(f"docs_next at stage {self.stage}")
@@ -530,7 +660,7 @@ class Portal:
                 if missing:
                     return httpx.Response(200, json={"status": "error", "message": missing})
                 return httpx.Response(200, json={"status": "ok"}), (lambda: setattr(self, "stage", "priceoffers"))
-            return await self.serve(request, P, build)
+            return await self.serve(request, self.lat("docs_next", P), build)
 
         @r.get(url__regex=rf".*/ru/application/priceoffers/{ANN}/{APP}$")
         async def priceoffers(request):
@@ -538,7 +668,7 @@ class Portal:
                 if self.stage != "priceoffers":
                     return self.redirect_to_stage()
                 return httpx.Response(200, html=self.price_page())
-            return await self.serve(request, G, build)
+            return await self.serve(request, self.lat("price_page", G), build)
 
         @r.post(url__regex=rf".*/ajax_get_encr_info/{ANN}/{APP}$")
         async def encr_info(request):
@@ -557,7 +687,7 @@ class Portal:
                 return httpx.Response(200, json={
                     "plnSum": "2221307.14", "minPrice": "1777045.72", "salt": salt,
                     "sign": "SRVSIGN", "info": f"566386_{lp};2221307.14;1777045.72;"})
-            return await self.serve(request, P, build)
+            return await self.serve(request, self.lat("encr_info", P), build)
 
         @r.post(url__regex=rf".*/ajax_add_encrypt/{ANN}/{APP}$")
         async def add_encrypt(request):
@@ -570,7 +700,7 @@ class Portal:
                 if form.get("salt") != self.salts.get(lp):
                     self.bad(f"add_encrypt with a STALE salt {form.get('salt')} != {self.salts.get(lp)}")
                 return httpx.Response(200, json={"status": "ok"}), (lambda: self.add_encrypt_done.add(lp))
-            return await self.serve(request, P, build)
+            return await self.serve(request, self.lat("add_encrypt", P), build)
 
         @r.post(url__regex=rf".*/ajax_save_gamma_signs/{ANN}/{APP}$")
         async def save_signs(request):
@@ -583,7 +713,7 @@ class Portal:
                     if self.signs_before_encrypt == "violation":
                         self.bad("save_gamma_signs before every add_encrypt committed")
                 return httpx.Response(200, json={"status": "ok"}), (lambda: setattr(self, "signs_saved", True))
-            return await self.serve(request, P, build)
+            return await self.serve(request, self.lat("save_signs", P), build)
 
         @r.post(url__regex=rf".*/ajax_priceoffers_next/{ANN}/{APP}$")
         async def price_next(request):
@@ -591,7 +721,7 @@ class Portal:
                 if not self.signs_saved:
                     self.bad("priceoffers_next before save_gamma_signs committed")
                 return httpx.Response(200, json={"status": "ok"}), (lambda: setattr(self, "stage", "preview"))
-            return await self.serve(request, P, build)
+            return await self.serve(request, self.lat("price_next", P), build)
 
         @r.post(url__regex=rf".*/ajax_public_application/{ANN}/{APP}$")
         async def public(request):
@@ -603,12 +733,16 @@ class Portal:
                 if self.stage != "preview":
                     self.bad(f"public_application at stage {self.stage}")
                     return httpx.Response(200, json={"status": "error", "message": "not ready"})
+                if self.ts_invalid:
+                    self.bad(f"published with a тех.спец signature of another file: {sorted(self.ts_invalid)}")
 
                 def commit():
                     self.stage = "public"
                     self.t_public = self.now()
                 return httpx.Response(200, json={"status": "ok"}), commit
-            return await self.serve(request, self.public_delay, build)
+            response = await self.serve(request, self.public_delay, build)
+            self.t_public_done = self.now()
+            return response
 
         @r.route()
         async def anything_else(request):
@@ -617,7 +751,7 @@ class Portal:
 
 
 async def run_scenario(cfg: dict) -> dict:
-    from goszakup import flow, tumar
+    from goszakup import flow, presign, tumar
     from goszakup.client import GoszakupClient
     from goszakup.state import StateStore
 
@@ -654,7 +788,9 @@ async def run_scenario(cfg: dict) -> dict:
 
     tz_cache = dict(cfg.get("tz_cache", {}))
     lp_cache = {ANN: [41391061]} if cfg.get("lp_cache") else {}
-    with tempfile.TemporaryDirectory() as tmp, patch.object(flow, "_open_tumar", open_tumar):
+    # The public host is served by the same mock router, under a path prefix.
+    with tempfile.TemporaryDirectory() as tmp, patch.object(flow, "_open_tumar", open_tumar), \
+            patch.object(presign, "PUBLIC_PORTAL", BASE + "/__public__"):
         async with respx.mock(base_url=BASE, assert_all_called=False) as router:
             portal.install(router)
             async with GoszakupClient(ci_session="dummy") as gz:
@@ -696,6 +832,11 @@ async def run_scenario(cfg: dict) -> dict:
 
     opened = portal.open_at
     after_open = [e for e in portal.log if e["t0"] >= opened]
+    # The bot counts from the moment it SAW the tender open (its "t0"): the
+    # answer to the first create-form read that carried the form.
+    detected = next((e["t1"] for e in portal.log
+                     if e["m"] == "GET" and e["path"].endswith(f"/application/create/{ANN}")
+                     and e.get("status") == 200), None)
     return {
         "step": getattr(state, "step", None),
         "error": error or getattr(state, "error", None),
@@ -705,13 +846,21 @@ async def run_scenario(cfg: dict) -> dict:
         "t_public": portal.t_public,
         "to_public_request_s": (round(portal.t_public_request - opened, 2)
                                 if portal.t_public_request is not None else None),
-        "from_open_s": round(portal.t_public - opened, 2) if portal.t_public else None,
+        # when the answer to the publish POST arrived — what the bot's report shows
+        "from_open_s": (round(portal.t_public_done - opened, 2)
+                        if portal.t_public and portal.t_public_done else None),
+        "published_at_s": round(portal.t_public - opened, 2) if portal.t_public else None,
+        "from_detection_s": (round(portal.t_public_done - detected, 2)
+                             if portal.t_public_done and detected is not None else None),
         "requests_after_open": len(after_open),
         "encr_info_calls": portal.encr_calls,
         "generated_files": portal.generated,
         "save_attempts": portal.save_attempts,
         "ts_attempts": {f"{k[0]}/{k[1]}": v for k, v in portal.ts_attempts.items()},
         "signs_posts": portal.signs_posts,
+        "docs_next_posts": portal.docs_next_posts,
+        "tz_cache_keys": sorted(tz_cache),
+        "all_requests": len(portal.log),
         "log": after_open if cfg.get("want_log") else None,
     }
 

@@ -59,6 +59,8 @@ goszakup/
   client.py        all AJAX endpoints + 5-step ECP login.
   tumar.py         TumarCSP WebSocket client (SetAPIKey/GetVersion/EncryptOfferPrice).
   flow.py          submit_bid() orchestrator (doc plan + gamma price).
+  hedge.py         HedgedRead: reads that overlap a stage-changing POST.
+  presign.py       signs the tender's public тех.спец files before the opening.
   local_signer.py  Kalkan Java GOST signer.
   pipeline.py      reusable _extract_app_lot_mapping.
   parser.py, state.py, secrets.py   helpers.
@@ -147,3 +149,51 @@ fallback each. The simulator models every portal reaction (`early_show_doc`,
 `ts_overlap`, `signs_before_encrypt`). Even with all of them the model gives
 ~20 s at the live latencies: the rest is portal time (≥0.6 s per PHP request
 even off-peak). Details and the dry-run checklist: `docs/PERFORMANCE_AUDIT.md`.
+
+## Speed work (25.11.2026) — trace #17983518, 22.1 s
+
+Details, the route-by-route model and the next-report checklist:
+`docs/PERFORMANCE_AUDIT.md`, section «Трасса #17983518».
+
+- The mandatory WRITES alone (create → add_lots → lots_next → generate →
+  download → save → docs_next → encr_info → popup → add_encrypt →
+  priceoffers_next → public) take 14.5–15 s at that trace's latencies. No
+  reordering reaches 10 s; only a faster portal (~0.6–0.7 s/request) does.
+  Never overlap writes to get there — the portal checks their order.
+- `hedged_reads` (default ON, `hedge.py`): the page a stage POST unlocks (draft
+  id during create, app_lot map + document list during lots_next, price page
+  during docs_next) is read on a 0.3–0.45 s cadence WHILE that POST is in
+  flight. Reads only. Rules that must hold for every such probe:
+  * it goes through `GoszakupClient.peek` — AJAX-flagged (CodeIgniter never
+    regenerates the session id on those) and its Set-Cookie is discarded (an
+    anonymous answer must not replace the live `ci_session`);
+  * its result is accepted only when complete and of THIS application
+    (`_probe_app_lots`, `_is_full_docs_page`, `_verified_price_page`);
+  * an early draft id counts only if the baseline read sent with the create
+    POST showed no draft (`_EarlyApplicationId`); `add_lots` still waits for
+    the create answer.
+- `presign_tech_spec` (default ON, `presign.py`): the announcement's file list
+  (`/ru/announce/actionAjaxModalShowFiles/<ann>/3334`) and its files are public
+  before the opening; the application holds byte-identical COPIES under new
+  file ids. They are signed during the wait, WITHOUT the cabinet cookie. A page
+  of doc 3334 whose link texts name those files is committed at once; every
+  copy is still downloaded and compared by sha256 before docs_next
+  (`_PresignLedger`), a mismatch is re-signed from the real bytes and re-saved.
+- The file server ignores `Range` (200 + full length) —
+  `ATAGOS_SPEC_RANGE_DOWNLOAD` cannot help on this portal.
+- Report diagnostics: `reply=` (key names + short codes of an AJAX answer,
+  `client.reply_shape`) and `ctx=` (the attribute/URL an id sits in,
+  `flow._id_context`). New fields must be added to the allowlists in
+  `bot/log_capture.py` or the report drops them.
+- OPEN: `flow.gamma.save_signs verdict=error` on a bid that was accepted. Until
+  the next report shows that answer's `reply=`, keep `gamma_parallel_saves` off.
+- `/config <switch> on|off` changes `lot_save_parallel`, `gamma_parallel_saves`,
+  `lot_barrier`, `hedged_reads`, `presign_tech_spec` at runtime (until restart).
+- Simulator knobs added for all of this: `read_at` / `commit_at` (when a request
+  looks at the draft / when its write lands, as fractions of its latency),
+  `lat` (per-route latencies, to replay a live trace), `listing`, `ts_names`,
+  `ts_copy_differs`, `verify_signatures`, `stale_app`. The live trace is pinned
+  as `test_replay_of_the_live_trace_17983518`.
+- Dev note: this checkout's directories may be read-only (archive extraction);
+  `chmod u+w` the directory before adding a file. `.venv` here is a Windows
+  venv — run tests with a Python 3.11 environment of your own.

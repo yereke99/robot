@@ -14,11 +14,14 @@ def test_speed_options_defaults_and_parsing():
     assert flow.speed_options({}) == {
         "lot_barrier": "each", "early_app_lots": True,
         "lot_save_parallel": False, "gamma_parallel_saves": False,
+        "hedged_reads": True, "presign_tech_spec": True,
     }
     opts = flow.speed_options({"lot_barrier": "last", "early_app_lots": "off",
-                               "lot_save_parallel": "yes", "gamma_parallel_saves": 1})
+                               "lot_save_parallel": "yes", "gamma_parallel_saves": 1,
+                               "hedged_reads": "no", "presign_tech_spec": 0})
     assert opts == {"lot_barrier": "last", "early_app_lots": False,
-                    "lot_save_parallel": True, "gamma_parallel_saves": True}
+                    "lot_save_parallel": True, "gamma_parallel_saves": True,
+                    "hedged_reads": False, "presign_tech_spec": False}
     assert flow.speed_options(None)["early_app_lots"] is True
     flow.AtagosBidParams(announce_id="1", tender_lot_ids=[1], **opts)   # accepted keys
 
@@ -105,3 +108,48 @@ def test_resolve_prefers_the_early_mapping_and_races_otherwise(monkeypatch):
         miss.cancel()
 
     asyncio.run(main())
+
+
+# ── /config: the same switches at runtime ────────────────────────────────────
+def test_config_command_seeds_and_overrides_the_speed_switches():
+    from types import SimpleNamespace
+
+    from goszakup.bot.handlers import settings
+
+    raw = {"defaults": {"lot_barrier": "last", "poll_interval_ms": 200, "dry_run": False}}
+    seeded = settings.seed_settings(raw)
+    assert {k: seeded[k] for k in settings.SPEED_KEYS} == {
+        "lot_save_parallel": False, "gamma_parallel_saves": False, "lot_barrier": "last",
+        "hedged_reads": True, "presign_tech_spec": True}
+
+    ctx = SimpleNamespace(config=SimpleNamespace(raw=raw), bid_settings=dict(seeded))
+    assert flow.speed_options(settings.speed_defaults(ctx))["lot_save_parallel"] is False
+    ctx.bid_settings["lot_save_parallel"] = settings._coerce("bool", "on")
+    ctx.bid_settings["lot_barrier"] = settings._coerce("barrier", " NONE ")
+    opts = flow.speed_options(settings.speed_defaults(ctx))
+    assert (opts["lot_save_parallel"], opts["lot_barrier"], opts["hedged_reads"]) == (True, "none", True)
+    assert settings.speed_defaults(ctx)["poll_interval_ms"] == 200        # the rest is untouched
+    with pytest.raises(ValueError):
+        settings._coerce("barrier", "sometimes")
+    assert set(settings.SPEED_KEYS) <= set(settings.SETTABLE)
+
+    # a context that never ran /config (or a CLI run) just uses config.yaml
+    bare = SimpleNamespace(config=SimpleNamespace(raw=raw), bid_settings={})
+    assert flow.speed_options(settings.speed_defaults(bare))["lot_barrier"] == "last"
+
+
+def test_early_document_list_must_link_every_planned_document():
+    """The list read while lots_next runs decides the id of Приложение 2, so a
+    partial page (an AJAX fragment, another stage) must not stand in for it."""
+    params = flow.AtagosBidParams(announce_id="555", tender_lot_ids=[1])
+
+    def page(doc_ids):
+        return "".join(f'<a href="/ru/application/show_doc/555/777/{d}">Перейти</a>' for d in doc_ids)
+
+    full = page([1253, 3359, 3334, 3730, 3335, 3328])          # agreement under a third id
+    assert flow._is_full_docs_page(full, params, "777")
+    assert flow._is_full_docs_page(page([1253, 3359, 3334, 3715, 3335, 3328]), params, "777")
+    assert not flow._is_full_docs_page(page([1253, 3359, 3334, 3335, 3328]), params, "777")  # no agreement row
+    assert not flow._is_full_docs_page(page([1253, 3359, 3334, 3730, 3335]), params, "777")  # no deposit row
+    assert not flow._is_full_docs_page(full.replace("/555/777/", "/555/778/"), params, "777")
+    assert not flow._is_full_docs_page("<html>lots</html>", params, "777")

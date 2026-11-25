@@ -106,13 +106,17 @@ _TRACE_NUMBER_FIELDS = {
     "attempt", "attempts", "strike", "level", "status", "len", "bytes", "body_len", "suffix_bytes",
     "n", "doc", "doc_id", "fid", "num", "pooled", "count", "accepted", "ok", "resumed",
     "pid", "dry_run", "parallel", "max_pending",
+    "hit", "named", "presigned", "listed",
 }
 _TRACE_ID_FIELDS = {"announce", "announce_id", "app_id", "app_lot", "lp_id"}
 _TRACE_DURATION_FIELDS = {"dt_s", "elapsed_s", "elapsed_ms", "waited_s", "spacing_s",
-                          "since_start_s", "total_s", "duration_s", "retry_s", "ms"}
+                          "since_start_s", "total_s", "duration_s", "retry_s", "ms", "lead_s"}
 _TRACE_PATH_FIELDS = {"path", "location", "final", "url", "dl"}
+# "reply" is client.reply_shape() (key names and short codes of an AJAX answer),
+# "ctx" is flow._id_context() (the attribute or URL segment an id sits in).
 _TRACE_CODE_FIELDS = {"verdict", "phase", "step", "source", "mode", "error_type",
-                      "pipeline_type", "release", "python", "version", "platform"}
+                      "pipeline_type", "release", "python", "version", "platform",
+                      "reply", "ctx"}
 _APPENDIX = re.compile(r"приложени[еяю]\s*№?\s*([0-9]{1,3})\b", re.IGNORECASE)
 
 
