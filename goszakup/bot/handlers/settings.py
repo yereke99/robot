@@ -41,12 +41,13 @@ SETTABLE: dict[str, tuple[str, str]] = {
     "gamma_parallel_saves": ("bool", "ЭКСПЕРИМЕНТ: подпись цены отправлять вместе с add_encrypt"),
     "lot_barrier": ("barrier", "Контрольное чтение после техспецификации: each | last | none"),
     "hedged_reads": ("bool", "Читать следующую страницу, пока портал ещё обрабатывает шаг"),
+    "early_create_id": ("bool", "Проверять ID черновика во время запроса создания"),
     "presign_tech_spec": ("bool", "Подписывать файлы техспецификации до открытия тендера"),
 }
 
 # The runtime-editable subset of flow.speed_options().
 SPEED_KEYS = ("lot_save_parallel", "gamma_parallel_saves", "lot_barrier",
-              "hedged_reads", "presign_tech_spec")
+              "hedged_reads", "early_create_id", "presign_tech_spec")
 
 # Defaults used if config.yaml `defaults` omits a key.
 # confirm_before_submit is OFF by default: at T0 every second counts, so the

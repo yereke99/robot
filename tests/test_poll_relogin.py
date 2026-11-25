@@ -8,10 +8,12 @@ proceed once the tender opens. Without a callback it raises as before.
 
 from __future__ import annotations
 
+import asyncio
 import types
 
 import pytest
 
+from goszakup import client
 from goszakup.client import GoszakupClient, SessionExpired
 
 
@@ -215,6 +217,60 @@ async def test_create_discovery_uses_redirect_without_loading_lots_page():
     assert app_id == "73859197"
     assert create.call_count == discover.call_count == 1
     assert lots.call_count == 0
+
+
+@pytest.mark.parametrize("rotate_session", [False, True])
+async def test_create_overlaps_at_most_one_id_read_after_the_baseline(monkeypatch, rotate_session):
+    monkeypatch.setattr(client, "_EARLY_ID_PROBE_DELAY_S", 0.01)
+    candidate_ready = asyncio.Event()
+    speculative_reads = 0
+    ann = "17905992"
+    application = "73859197"
+    other_application = "73859198"
+
+    async def answer_create(request):
+        await asyncio.wait_for(candidate_ready.wait(), 1)
+        await asyncio.sleep(0)
+        headers = {"Set-Cookie": "ci_session=rotated; Path=/"} if rotate_session else {}
+        return httpx.Response(200, json={"status": "ok"}, headers=headers)
+
+    def read_lots(request):
+        nonlocal speculative_reads
+        if request.headers.get("X-Requested-With") != "XMLHttpRequest":
+            return httpx.Response(302, headers={"Location": f"/ru/application/lots/{ann}/{application}"})
+        speculative_reads += 1
+        if speculative_reads == 1:
+            return httpx.Response(302, headers={"Location": f"/ru/application/create/{ann}"})
+        candidate_ready.set()
+        candidate = other_application if rotate_session else application
+        return httpx.Response(200, html=f'<a href="/ru/application/lots/{ann}/{candidate}">Лоты</a>')
+
+    async with respx.mock(base_url=_BASE) as router:
+        router.get(f"/ru/application/create/{ann}").respond(200, html=_CREATE_FORM)
+        create = router.post(f"/ru/application/ajax_create_application/{ann}").mock(side_effect=answer_create)
+        read = router.get(f"/ru/application/lots/{ann}").mock(side_effect=read_lots)
+        async with GoszakupClient(ci_session="dummy") as gz:
+            app_id = await gz.create_application(
+                ann, subject_address="165932", iik="2589827", early_id=True,
+            )
+    assert app_id == application
+    assert create.call_count == 1
+    assert speculative_reads == 2
+    assert read.call_count == (3 if rotate_session else 2)
+
+
+@pytest.mark.parametrize("target", [
+    "/ru/user/login",
+    "/ru/application/create/17905993",
+    "https://example.org/ru/application/create/17905992",
+])
+async def test_unrelated_redirect_cannot_confirm_absence_of_an_earlier_draft(monkeypatch, target):
+    async def redirect(path):
+        return httpx.Response(302, headers={"Location": target})
+
+    async with GoszakupClient(ci_session="dummy") as gz:
+        monkeypatch.setattr(gz, "peek", redirect)
+        assert await gz._read_application_id("17905992") == (False, None)
 
 
 @pytest.mark.parametrize("target", [

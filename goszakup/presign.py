@@ -1,33 +1,9 @@
-"""Sign the tender's own lot documents before the application exists.
+"""Warm the signature cache from publicly listed technical specifications.
 
-Приложение 15 (the тех.спец and its additional files) is not written by the
-bidder: the application receives COPIES of the files the customer attached to
-the tender, and the bidder signs those copies. Checked on tender 17983518 — the
-copies get new file ids, but their sizes equal the originals byte for byte, and
-the originals are listed (and downloadable) on the announcement's
-"Документация" tab long before the tender opens.
-
-So the slow part — downloading the files — can happen while the bot waits for
-the opening:
-
-  * ``run`` reads that list, downloads every file of the selected lots and
-    signs it. Signatures go into the usual content cache (sha256 -> CMS).
-  * After the application is created, a page of doc 3334 links the copies by
-    file name. A copy whose name matches exactly one pre-signed file is
-    committed with that signature at once, while its bytes are downloaded in
-    the background and compared by sha256 (flow._verify_presigned). A mismatch
-    is re-signed from the real bytes and re-saved before docs_next is called,
-    so nothing unverified ever reaches the next stage.
-
-Nothing here presents the cabinet session. The files and the public list are
-served without a login, so every request goes out on a client that carries no
-``ci_session`` — while the bot waits for the opening, a request that made the
-portal rotate the session on a side connection would leave the main client
-holding a dead cookie. (Only if the public list cannot be reached is the list
-read once on the MAIN client, whose own jar then absorbs any rotation.)
-
-Everything here is an optimisation: any failure leaves the bid on the usual
-download -> sign -> save path.
+The application can use different file IDs for its copies. Only the verified
+content hash lets the normal signing path reuse an existing signature.
+Public downloads go through an anonymous client. If needed, the document
+list can be fetched through the main authenticated client.
 """
 
 from __future__ import annotations
@@ -37,7 +13,7 @@ import html
 import re
 import time
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence
+from typing import Optional, Sequence
 
 import httpx
 import structlog
@@ -65,11 +41,6 @@ def _text(fragment: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(_TAG.sub(" ", fragment or ""))).strip()
 
 
-def name_key(name: str) -> str:
-    """How two spellings of one file name are compared."""
-    return _text(name).casefold()
-
-
 def _download_links(fragment: str) -> list[tuple[int, Optional[str], str, str]]:
     """[(file_id, token, host, link text)] for every download link in the HTML."""
     out = []
@@ -87,16 +58,6 @@ def _download_links(fragment: str) -> list[tuple[int, Optional[str], str, str]]:
             continue
         out.append((int(found.group(1)), found.group(2), url.host or "", _text(inner)))
     return out
-
-
-def link_names(page_html: str) -> dict[int, list[str]]:
-    """file_id -> the texts of the links that download it, in page order."""
-    names: dict[int, list[str]] = {}
-    for fid, _token, _host, text in _download_links(page_html):
-        bucket = names.setdefault(fid, [])
-        if text and text not in bucket:
-            bucket.append(text)
-    return names
 
 
 @dataclass(frozen=True)
@@ -131,49 +92,6 @@ def parse_tender_files(listing_html: str, portal_host: str) -> list[ListedFile]:
             seen.add(fid)
             files.append(ListedFile(lot, fid, f"/files/download_file/{fid}/{token}/", text))
     return files
-
-
-@dataclass(frozen=True)
-class PresignedFile:
-    name: str
-    key: str
-    lot: Optional[int]
-    size: int
-    sha256: str
-    signature: str
-    source_fid: int
-
-
-class TenderFiles:
-    """Pre-signed tender files, filled in as each one is ready."""
-
-    def __init__(self) -> None:
-        self._files: list[PresignedFile] = []
-        self.listed = 0
-        self.source = "none"
-        self.finished = False
-
-    def __len__(self) -> int:
-        return len(self._files)
-
-    def add(self, item: PresignedFile) -> None:
-        self._files.append(item)
-
-    def match(self, lot: Optional[int], names: Iterable[str]) -> Optional[PresignedFile]:
-        """The single pre-signed file these link texts name, else None.
-
-        Two listed files with the same name and different content (the same
-        template attached to two lots, say) are never guessed between.
-        """
-        keys = {name_key(name) for name in names}
-        keys.discard("")
-        if not keys:
-            return None
-        found = [item for item in self._files
-                 if item.key in keys and (item.lot is None or lot is None or item.lot == lot)]
-        if len({item.sha256 for item in found}) != 1:
-            return None
-        return found[0]
 
 
 _XHR = {"X-Requested-With": "XMLHttpRequest", "Accept": "text/html, */*; q=0.01"}
@@ -217,29 +135,31 @@ async def _download(anonymous, path: str) -> Optional[bytes]:
 
 
 async def run(anonymous, signer, *, announce_id: str, lot_ids: Sequence[int], doc_id: int,
-              sig_cache: Optional[dict], files: TenderFiles, main_http=None) -> None:
+              sig_cache: dict, main_http=None) -> None:
     """Download and sign the tender's files of ``doc_id`` for the chosen lots.
 
     ``anonymous`` is a client WITHOUT the cabinet session (GoszakupClient.
     clone_unauthenticated()); ``signer`` a LocalSigner on it. ``main_http`` is
-    the main client's httpx client, used for the list only if the public one
-    is unreachable. Results appear in ``files`` one by one, so a file that is
-    ready helps even while a larger one is still loading.
+    the main client's httpx client, used for the list if the public one
+    is unreachable.
     """
     started = time.monotonic()
     listing, source = await _listing(anonymous, main_http, str(announce_id), int(doc_id))
     entries = parse_tender_files(listing, httpx.URL(anonymous.base_url).host)
-    files.listed, files.source = len(entries), source
     chosen = {int(lot) for lot in lot_ids}
     wanted = [entry for entry in entries if entry.lot is None or entry.lot in chosen]
     if not wanted:
         wanted = entries            # the lot column did not carry the lot id
     wanted = wanted[:_MAX_FILES]
     gate = asyncio.Semaphore(_CONCURRENCY)
-    total = 0
+    total = downloaded = cached = 0
 
     async def one(entry: ListedFile) -> None:
-        nonlocal total
+        nonlocal total, downloaded, cached
+        key = f"public_fid:{entry.fid}"
+        if signer.cached_signature(sig_cache, key):
+            cached += 1
+            return
         async with gate:
             if total > _MAX_TOTAL_BYTES:
                 return
@@ -252,11 +172,10 @@ async def run(anonymous, signer, *, announce_id: str, lot_ids: Sequence[int], do
                 log.info("flow.presign.file_miss", fid=entry.fid, verdict="not_served")
                 return
             total += len(data)
-            digest, signature = await signer.sign_content(data, sig_cache)
-            files.add(PresignedFile(
-                name=entry.name, key=name_key(entry.name), lot=entry.lot, size=len(data),
-                sha256=digest, signature=signature, source_fid=entry.fid))
+            _, signature = await signer.sign_content(data, sig_cache)
+            signer.remember_signature(sig_cache, key, signature)
+            downloaded += 1
 
     await asyncio.gather(*(one(entry) for entry in wanted))
-    log.info("flow.presign.done", source=source, listed=len(entries), n=len(files),
+    log.info("flow.presign.done", source=source, listed=len(entries), n=downloaded, cached=cached,
              bytes=total, elapsed_s=round(time.monotonic() - started, 2))

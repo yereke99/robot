@@ -53,13 +53,9 @@ log = structlog.get_logger("client")
 
 DEFAULT_BASE_URL = "https://v3bl.goszakup.gov.kz"
 
-# Reads of the draft's id that overlap ajax_create_application (see
-# _EarlyApplicationId). The create POST takes 2.6-2.8 s at T0; the read that
-# used to follow it took another 0.7-1.5 s.
-_EARLY_ID_FIRST_DELAY_S = 0.5
-_EARLY_ID_INTERVAL_S = 0.45
-_EARLY_ID_MAX_INFLIGHT = 3
-_EARLY_ID_MAX_TOTAL = 7
+# Most creates in the timing reports take over two seconds. One opt-in read
+# near the end can pick up the draft if the portal commits before answering.
+_EARLY_ID_PROBE_DELAY_S = 1.8
 
 _SHAPE_KEY = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,15}")
 _SHAPE_WORD = re.compile(r"[A-Za-z_]{1,12}")
@@ -270,49 +266,52 @@ class _TimedTransport(httpx.AsyncHTTPTransport):
 class _EarlyApplicationId:
     """Learn the new draft's id while ajax_create_application is in flight.
 
-    The create POST answers ``{"status":"ok"}`` with no id, so the id used to
-    cost one more page read after it. Here the same read is repeated while the
-    POST is still running (HedgedRead); as soon as the portal has stored the
-    draft, a probe returns its id.
-
-    A draft that was ALREADY visible when the POST was sent would look exactly
-    like the new one, so the first read ("baseline", sent together with the
-    POST) decides whether early ids can be trusted at all: only if it showed no
-    draft does a later id count. Otherwise the usual read after the POST's
-    answer is used, as before. Nothing is written on the strength of an early
-    id until the create POST itself has answered without an error.
+    The baseline read must point back to the create form, since an older draft
+    can have the same appearance as a new one. At most one later read can be
+    reused, after the create POST confirms success on the same session.
     """
 
     def __init__(self, client: "GoszakupClient", announce_id: str):
         self._client = client
         self._announce_id = str(announce_id)
+        self._session = client.get_cookie("ci_session")
         self._baseline: Optional[asyncio.Task] = None
         self._hedge: Optional[HedgedRead] = None
         self.ambiguous = False
+        self._create_finished = False
 
     def start(self) -> None:
         loop = asyncio.get_running_loop()
         self._baseline = loop.create_task(self._client._read_application_id(self._announce_id))
         self._hedge = HedgedRead(
-            self._probe, first_delay_s=_EARLY_ID_FIRST_DELAY_S, interval_s=_EARLY_ID_INTERVAL_S,
-            max_inflight=_EARLY_ID_MAX_INFLIGHT, max_total=_EARLY_ID_MAX_TOTAL, label="app_id",
+            self._probe, first_delay_s=_EARLY_ID_PROBE_DELAY_S,
+            max_inflight=1, max_total=1, label="app_id",
         ).start()
 
     async def _probe(self, attempt: int) -> Optional[str]:
-        answered, app_id = await self._client._read_application_id(self._announce_id)
-        if not answered or not app_id:
-            return None
         clean, seen_before = await asyncio.shield(self._baseline)
-        if not clean or seen_before:
+        if self._create_finished:
+            return None
+        if not clean or seen_before or self._client.get_cookie("ci_session") != self._session:
             self.ambiguous = True
-            self._hedge.stop()
+            return None
+        answered, app_id = await self._client._read_application_id(self._announce_id)
+        return app_id if answered else None
+
+    async def _confirmed_probe(self) -> Optional[str]:
+        app_id = await self._hedge.first()
+        if self._client.get_cookie("ci_session") != self._session:
             return None
         return app_id
 
     async def resolve(self, usual) -> Optional[str]:
         """The id for a create POST that answered without one."""
+        self._create_finished = True
         hedge = self._hedge
         hedge.stop()
+        if self._client.get_cookie("ci_session") != self._session:
+            log.info("create_application.early_id", ok=False, verdict="session_changed")
+            return await usual()
         early = hedge.hit
         if early is not None and not self.ambiguous:
             lead = asyncio.get_running_loop().time() - (hedge.hit_at or 0.0)
@@ -321,10 +320,8 @@ class _EarlyApplicationId:
         if self.ambiguous:
             log.info("create_application.early_id", ok=False, verdict="draft_seen_before_create")
             return await usual()
-        # No probe has answered with an id yet: start the usual read now and
-        # take whichever names the draft first. (A probe only ever returns an
-        # id that passed the baseline rule above.)
-        app_id, from_probe = await first_of(hedge.first(), usual)
+        # Start the usual read immediately if the single probe is still pending.
+        app_id, from_probe = await first_of(self._confirmed_probe(), usual)
         log.info("create_application.early_id", ok=bool(from_probe), lead_s=0.0, n=hedge.launched)
         return app_id
 
@@ -780,7 +777,7 @@ class GoszakupClient:
             cur_iik = valid_iiks[0]
 
         watch: Optional[_EarlyApplicationId] = None
-        if early_id:
+        if early_id and self.get_cookie("ci_session"):
             watch = _EarlyApplicationId(self, announce_id)
             watch.start()
         try:
@@ -831,6 +828,7 @@ class GoszakupClient:
         )
 
         # Surface server-side errors
+        j = None
         try:
             j = r.json()
             if isinstance(j, dict) and j.get("status") in ("error", "fail"):
@@ -862,7 +860,8 @@ class GoszakupClient:
 
         # Fallback: GET lots page, follow redirects, parse final URL.
         log.info("create_application.discover_id", status=r.status_code)
-        if watch is not None:
+        if (watch is not None and r.is_success and isinstance(j, dict)
+                and j.get("status") == "ok" and not (j.get("error") or j.get("errors"))):
             return await watch.resolve(lambda: self._discover_application_id(announce_id))
         return await self._discover_application_id(announce_id)
 
@@ -881,14 +880,27 @@ class GoszakupClient:
         except Exception as exc:  # noqa: BLE001 — a probe; the usual read still runs
             log.debug("create_application.early_id_read_failed", error_type=type(exc).__name__)
             return False, None
-        if r.status_code in (301, 302, 303, 307, 308):
-            return True, self._app_id_from_target(r.headers.get("location") or "", announce_id)
+        if r.is_redirect:
+            location = r.headers.get("location") or ""
+            app_id = self._app_id_from_target(location, announce_id)
+            if app_id:
+                return True, app_id
+            base = httpx.URL(self.base_url)
+            try:
+                target = base.join(location)
+            except (httpx.InvalidURL, ValueError):
+                return False, None
+            same_origin = (target.scheme, target.host, target.port) == (base.scheme, base.host, base.port)
+            create_path = rf"/(?:(?:ru|en|kz)/)?application/create/{re.escape(announce_id)}/?"
+            return same_origin and bool(re.fullmatch(create_path, target.path)), None
         if r.status_code != 200:
             return False, None
-        ids = set(re.findall(rf"/application/[a-z_]+/{re.escape(announce_id)}/(\d+)", r.text))
-        if len(ids) > 1:
-            return False, None
-        return True, (ids.pop() if ids else None)
+        ids = {
+            app_id
+            for target in re.findall(r"""\b(?:href|action)\s*=\s*["']([^"']+)["']""", r.text, re.IGNORECASE)
+            if "/application/" in target and (app_id := self._app_id_from_target(target, announce_id))
+        }
+        return (True, ids.pop()) if len(ids) == 1 else (False, None)
 
     def _extract_app_id_from_response(
         self, r: httpx.Response, announce_id: str

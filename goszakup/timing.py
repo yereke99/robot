@@ -240,8 +240,12 @@ class BidTrace:
             busy = _http_elapsed(phase_http, start, finish)
             lines.append(f"{phase} · {finish - start:.2f} с · HTTP {len(phase_http)} зап. / {busy:.2f} с")
             labels = Counter(_operation(event) for event in phase_events)
+
+            def elapsed_here(event: TraceEvent) -> float:
+                return min(event.duration, finish - event.start)
+
             slowest = {}
-            for event in sorted(phase_events, key=lambda entry: -entry.duration):
+            for event in sorted(phase_events, key=elapsed_here, reverse=True):
                 slowest.setdefault(_operation(event), event)
             if phase == "Цена":
                 priority = ("GET priceoffers", "POST ajax_get_encr_info", "EncryptOfferPrice (окно цены)",
@@ -254,7 +258,12 @@ class BidTrace:
             for label, event in selected_events:
                 count = f" (макс. из {labels[label]})" if labels[label] > 1 else ""
                 status = f" [{event.status}]" if event.status else ""
-                lines.append(f"  {label[:70]} {event.duration:.2f} с{status}{count}")
+                duration_here = elapsed_here(event)
+                if duration_here + 0.005 < event.duration:
+                    duration_text = f"{duration_here:.2f} с в этапе ({event.duration:.2f} с всего)"
+                else:
+                    duration_text = f"{event.duration:.2f} с"
+                lines.append(f"  {label[:70]} {duration_text}{status}{count}")
         selected = []
         available = max_chars
         for line in lines:

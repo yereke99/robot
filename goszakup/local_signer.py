@@ -363,15 +363,6 @@ class LocalSigner:
             sig_cache[content_key] = signature
         return content_hash, signature
 
-    async def fetch_bytes(self, download_url: str, *, referer: Optional[str] = None) -> bytes:
-        """Download a portal file with this signer's session (no signing)."""
-        url = download_url
-        if hasattr(self._http, "base_url") and str(self._http.base_url):
-            base = str(self._http.base_url).rstrip("/")
-            if url.startswith(base):
-                url = url[len(base):]
-        return await self._download_file(url, {"Referer": referer} if referer else {}, False)
-
     async def _get_file_suffix(
         self, url: str, headers: dict[str, str], offset: int, size: int, etag: str,
     ) -> bytes | None:

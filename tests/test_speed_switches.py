@@ -3,25 +3,29 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from websockets.protocol import State
 
-from goszakup import flow
+from goszakup import flow, tumar
 
 
 def test_speed_options_defaults_and_parsing():
     assert flow.speed_options({}) == {
         "lot_barrier": "each", "early_app_lots": True,
         "lot_save_parallel": False, "gamma_parallel_saves": False,
-        "hedged_reads": True, "presign_tech_spec": True,
+        "hedged_reads": True, "early_create_id": False, "presign_tech_spec": True,
     }
     opts = flow.speed_options({"lot_barrier": "last", "early_app_lots": "off",
                                "lot_save_parallel": "yes", "gamma_parallel_saves": 1,
-                               "hedged_reads": "no", "presign_tech_spec": 0})
+                               "hedged_reads": "no", "early_create_id": "yes", "presign_tech_spec": 0})
     assert opts == {"lot_barrier": "last", "early_app_lots": False,
                     "lot_save_parallel": True, "gamma_parallel_saves": True,
-                    "hedged_reads": False, "presign_tech_spec": False}
+                    "hedged_reads": False, "early_create_id": True, "presign_tech_spec": False}
     assert flow.speed_options(None)["early_app_lots"] is True
     flow.AtagosBidParams(announce_id="1", tender_lot_ids=[1], **opts)   # accepted keys
 
@@ -120,7 +124,7 @@ def test_config_command_seeds_and_overrides_the_speed_switches():
     seeded = settings.seed_settings(raw)
     assert {k: seeded[k] for k in settings.SPEED_KEYS} == {
         "lot_save_parallel": False, "gamma_parallel_saves": False, "lot_barrier": "last",
-        "hedged_reads": True, "presign_tech_spec": True}
+        "hedged_reads": True, "early_create_id": False, "presign_tech_spec": True}
 
     ctx = SimpleNamespace(config=SimpleNamespace(raw=raw), bid_settings=dict(seeded))
     assert flow.speed_options(settings.speed_defaults(ctx))["lot_save_parallel"] is False
@@ -138,18 +142,60 @@ def test_config_command_seeds_and_overrides_the_speed_switches():
     assert flow.speed_options(settings.speed_defaults(bare))["lot_barrier"] == "last"
 
 
-def test_early_document_list_must_link_every_planned_document():
-    """The list read while lots_next runs decides the id of Приложение 2, so a
-    partial page (an AJAX fragment, another stage) must not stand in for it."""
-    params = flow.AtagosBidParams(announce_id="555", tender_lot_ids=[1])
+async def test_price_watch_probes_only_the_first_document_check(monkeypatch):
+    monkeypatch.setattr(flow, "_PRICE_READ_DELAY_S", 0.0)
+    watch = flow._PricePageWatch(None, "555", "777")
+    probe = AsyncMock(return_value=None)
+    monkeypatch.setattr(watch, "_probe", probe)
 
-    def page(doc_ids):
-        return "".join(f'<a href="/ru/application/show_doc/555/777/{d}">Перейти</a>' for d in doc_ids)
+    watch.poll_started()
+    assert await watch.early() is None
+    assert watch.early() is None
+    await watch.poll_rejected()
+    watch.poll_started()
+    assert watch.early() is None
+    probe.assert_awaited_once()
 
-    full = page([1253, 3359, 3334, 3730, 3335, 3328])          # agreement under a third id
-    assert flow._is_full_docs_page(full, params, "777")
-    assert flow._is_full_docs_page(page([1253, 3359, 3334, 3715, 3335, 3328]), params, "777")
-    assert not flow._is_full_docs_page(page([1253, 3359, 3334, 3335, 3328]), params, "777")  # no agreement row
-    assert not flow._is_full_docs_page(page([1253, 3359, 3334, 3730, 3335]), params, "777")  # no deposit row
-    assert not flow._is_full_docs_page(full.replace("/555/777/", "/555/778/"), params, "777")
-    assert not flow._is_full_docs_page("<html>lots</html>", params, "777")
+
+async def test_price_watch_discards_page_loaded_during_session_change():
+    async with flow.GoszakupClient(base_url="https://portal.test", ci_session="session") as client:
+        async def peek(path):
+            client.adopt_ci_session("new-session")
+            return httpx.Response(
+                200, request=httpx.Request("GET", f"https://portal.test{path}"),
+                html='<input id="public_key" value="KEY"><input app_lot_id="300" buy_lot_point_id="400">',
+            )
+
+        client.peek = peek
+        watch = flow._PricePageWatch(client, "555", "777")
+        assert await watch._probe(1) is None
+
+
+async def test_ready_price_page_uses_one_encryption_request(monkeypatch):
+    provider = tumar.TumarCSP(api_key="unused", autofill=lambda _: False)
+    provider._ws = SimpleNamespace(state=State.OPEN)
+    provider.version = "2.0.0.0"
+    monkeypatch.setattr(provider, "encrypt_offer_price", AsyncMock(
+        return_value=tumar.EncryptResult(encrypted_data="ENC", session_key="KEY", info="SN", sign="SIGN")))
+    signer = SimpleNamespace(sign_xml_batch=AsyncMock(return_value={400: "CMS"}))
+    params = flow.AtagosBidParams(announce_id="555", tender_lot_ids=[1], tumar=provider)
+    page = '<input id="public_key" value="KEY"><input app_lot_id="300" buy_lot_point_id="400">'
+    prefetch = AsyncMock()
+    monkeypatch.setattr(flow, "_prefetch_encr_info", prefetch)
+
+    async with flow.GoszakupClient(base_url="https://portal.test", ci_session="session") as client:
+        client._get_page = AsyncMock()
+        client.get_encr_info = AsyncMock(return_value={"info": "5_400;100;80;", "salt": "fresh", "sign": "SIGN"})
+        for method in ("add_encrypt", "save_gamma_signs", "priceoffers_next_gamma"):
+            monkeypatch.setattr(client, method, AsyncMock(return_value=httpx.Response(200, json={"status": "ok"})))
+        ready = asyncio.get_running_loop().create_future()
+        ready.set_result(flow.FetchedPricePage(page, flow._price_session_cookies(client)))
+        watch = SimpleNamespace(early=lambda: ready, aclose=AsyncMock())
+        async with AsyncExitStack() as stack:
+            assert await flow._gamma_price(
+                client, signer, params, "777", stack, cached_lp_id=400, price_watch=watch) == ([400], {400: 80})
+
+    watch.aclose.assert_awaited_once()
+    client._get_page.assert_not_awaited()
+    prefetch.assert_not_awaited()
+    client.get_encr_info.assert_awaited_once_with("555", "777", lp_id=400, version="2.0.0.0")

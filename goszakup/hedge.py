@@ -86,6 +86,10 @@ class HedgedRead(Generic[T]):
             return first.result()
         return None
 
+    @property
+    def finished(self) -> bool:
+        return self._first is None or self._first.done()
+
     async def first(self) -> Optional[T]:
         """The first result a probe returned, or None once launching has ended
         and every probe in flight has answered without one."""

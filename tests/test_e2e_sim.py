@@ -63,16 +63,13 @@ def _create_stage(result):
 
 
 def test_status_only_create_discovers_the_draft_before_selecting_lots():
-    """A portal that shows the draft only once the create POST has answered:
-    every read sent meanwhile is redirected, the read sent with the answer names
-    the draft — the same moment as before the reads were overlapped."""
+    """The default starts one authoritative ID read after acknowledged creation."""
     result = _run(STATUS_ONLY)
     _assert_submitted(result)
 
     create, reads, add, nxt = _create_stage(result)
     assert create["t1"] - create["t0"] == pytest.approx(2.625, abs=0.001)
-    during = [r for r in reads if r["t0"] < create["t1"]]
-    assert during and all(r.get("status") in (302, None) for r in during)   # None: dropped unanswered
+    assert len(reads) == 1
     named = [r for r in reads if r.get("status") == 200]
     assert len(named) == 1 and named[0]["t0"] == pytest.approx(create["t1"], abs=0.001)
     assert named[0]["t1"] - named[0]["t0"] == pytest.approx(0.704, abs=0.001)
@@ -87,7 +84,8 @@ def test_draft_id_is_read_while_the_create_post_is_still_running():
     """A portal that stores the draft before it answers: a read sent meanwhile
     names it, and add_lots goes out with the create answer — no read after it."""
     strict = _run(STATUS_ONLY)
-    result = _run({**STATUS_ONLY, "read_at": 0.6, "commit_at": 0.85})
+    result = _run({**STATUS_ONLY, "read_at": 0.6, "commit_at": 0.80,
+                   "defaults": {"early_create_id": True}})
     _assert_submitted(result)
 
     create, reads, add, _nxt = _create_stage(result)
@@ -102,7 +100,8 @@ def test_draft_id_is_read_while_the_create_post_is_still_running():
 def test_a_draft_seen_before_create_is_never_taken_for_the_new_one():
     """An older draft of the tender is on the page before create commits. Its id
     looks exactly like a new one, so early reads are not trusted at all."""
-    result = _run({**STATUS_ONLY, "read_at": 0.6, "commit_at": 0.85, "stale_app": "73000001"})
+    result = _run({**STATUS_ONLY, "read_at": 0.6, "commit_at": 0.80, "stale_app": "73000001",
+                   "defaults": {"early_create_id": True}})
     _assert_submitted(result)                 # a request for 73000001 would be a violation
     create, reads, add, _nxt = _create_stage(result)
     after = [r for r in reads if r["t0"] >= create["t1"] and r.get("status") == 200]
@@ -427,39 +426,27 @@ def _copies(result):
     return [r for r in result["log"] if "/files/download_file/7" in r["path"]]
 
 
-def test_presigned_tech_spec_is_committed_while_its_copy_is_still_downloading():
-    off = _run({**FAST, "lag": 0.0, "want_log": True, "defaults": {"presign_tech_spec": False}})
-    on = _run({**FAST, "lag": 0.0, "want_log": True})
-    _assert_submitted(off)
-    _assert_submitted(on)
+def test_presigned_tech_spec_waits_for_the_actual_copy_before_saving():
+    result = _run({**FAST, "lag": 0.0, "want_log": True, "verify_signatures": True})
+    _assert_submitted(result)
 
-    # before: a page is saved only after its files have been downloaded
-    assert min(s["t0"] for s in _ts_saves(off)) >= min(c["t1"] for c in _copies(off))
-    # now: the saves go out as soon as the page names the files ...
-    saves, copies = _ts_saves(on), _copies(on)
+    saves, copies = _ts_saves(result), _copies(result)
     assert len(saves) == 2 and len(copies) == 3
-    assert max(s["t0"] for s in saves) < max(c["t1"] for c in copies)
-    # ... and docs_next still waits until every copy has been compared
-    docs_next = _paths(on, "/ajax_docs_next/")[0]
-    assert max(c["t1"] for c in copies) <= docs_next["t0"]
-    assert set(on["ts_attempts"].values()) == {1} and on["docs_next_posts"] == 1
-    # (page 1 was already being committed while page 2 downloaded, so the gain
-    # is the rest of the largest download, not all of it)
-    assert on["from_open_s"] <= off["from_open_s"] - 0.5
+    assert max(c["t1"] for c in copies) <= saves[-1]["t0"]
+    docs_next = _paths(result, "/ajax_docs_next/")[0]
+    assert saves[-1]["t1"] <= docs_next["t0"]
+    assert set(result["ts_attempts"].values()) == {1} and result["docs_next_posts"] == 1
 
 
 @pytest.mark.parametrize("portal_verifies", [True, False])
-def test_copy_that_differs_from_the_tender_file_is_resaved_before_docs_next(portal_verifies):
-    """The early signature belongs to the tender's file. If the application's
-    copy is not that file, the page is signed again from the real bytes and
-    saved again — whether or not the portal would have noticed by itself."""
+def test_copy_that_differs_from_the_tender_file_is_signed_once_from_its_own_bytes(portal_verifies):
     result = _run({**FAST, "lag": 0.0, "ts_copy_differs": [2], "want_log": True,
                    "verify_signatures": portal_verifies})
     _assert_submitted(result)                   # publishing a wrong signature is a violation
-    assert result["ts_attempts"] == {"85000001/1": 1, "85000001/2": 2}
-    assert result["docs_next_posts"] == 1       # corrected first, not found out by a rejection
-    resave = _ts_saves(result)[-1]
-    assert resave["path"].endswith("/2") and resave["t1"] <= _paths(result, "/ajax_docs_next/")[0]["t0"]
+    assert result["ts_attempts"] == {"85000001/1": 1, "85000001/2": 1}
+    assert result["docs_next_posts"] == 1
+    save = _ts_saves(result)[-1]
+    assert save["path"].endswith("/2") and save["t1"] <= _paths(result, "/ajax_docs_next/")[0]["t0"]
 
 
 @pytest.mark.parametrize("variant", [
@@ -512,7 +499,7 @@ def test_stage_pages_are_read_while_the_stage_post_is_still_in_flight():
     assert min(writes) >= lots_next["t1"]
     assert _paths(soft, "/ajax_get_encr_info/")[0]["t0"] >= docs_next["t1"]
     assert soft["encr_info_calls"] == 1
-    assert soft["from_detection_s"] <= strict["from_detection_s"] - 1.2
+    assert soft["from_detection_s"] <= strict["from_detection_s"] - 0.5
 
 
 def test_overlapping_reads_cost_no_time_on_a_portal_that_never_serves_them_early():
@@ -522,7 +509,7 @@ def test_overlapping_reads_cost_no_time_on_a_portal_that_never_serves_them_early
     _assert_submitted(off)
     _assert_submitted(on)
     assert on["from_detection_s"] <= off["from_detection_s"] + 0.01
-    assert on["requests_after_open"] - off["requests_after_open"] <= 16     # the price: extra reads
+    assert on["requests_after_open"] - off["requests_after_open"] <= 2
 
 
 # Every route's latency as measured in the live report of bid #17983518.
@@ -555,6 +542,6 @@ def test_replay_of_the_live_trace_17983518():
     for result in (then, now_strict, now_soft, all_on):
         _assert_submitted(result)
     assert then["from_detection_s"] == pytest.approx(22.14, abs=0.3)      # the model fits
-    assert now_strict["from_detection_s"] <= 21.3
-    assert now_soft["from_detection_s"] <= 19.4
-    assert all_on["from_detection_s"] <= 17.6
+    assert now_strict["from_detection_s"] <= then["from_detection_s"] + 0.1
+    assert now_soft["from_detection_s"] <= now_strict["from_detection_s"] - 0.5
+    assert all_on["from_detection_s"] <= now_soft["from_detection_s"] - 1.0

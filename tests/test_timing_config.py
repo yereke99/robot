@@ -679,6 +679,18 @@ def test_bid_trace_summarizes_portal_connections_and_measured_file_transfer():
     assert "1.00 МБ за 0.80 с · 10.0 Мбит/с на этом запросе" in summary
 
 
+def test_bid_trace_shows_only_the_portion_of_a_long_read_inside_the_phase():
+    trace = gz_timing.BidTrace()
+    trace.marks = [(0.0, "t0"), (5.47, "lots_done"), (15.0, "bid_finished")]
+    trace.events.extend([
+        (0.03, 2.27, "POST", "/ru/application/ajax_create_application/1", "200"),
+        (4.94, 9.89, "GET", "/ru/application/docs/1/2", "302"),
+    ])
+    summary = trace.render_summary()
+    assert "GET docs 0.53 с в этапе (9.89 с всего) [302]" in summary
+    assert summary.index("POST ajax_create_application") < summary.index("GET docs")
+
+
 def test_bid_trace_summary_uses_wall_time_for_overlapping_requests():
     event = gz_timing.TraceEvent
     trace = gz_timing.BidTrace()
